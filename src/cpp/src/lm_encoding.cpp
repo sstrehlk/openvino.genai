@@ -295,9 +295,11 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
         for (size_t seq_id = 0; seq_id < num_outputs; ++seq_id) {
             const auto & sequence = sequences[seq_id];
             const float score = sampling_params.is_beam_search() ? sequence->get_beam_search_score(sampling_params) : sequence->get_cumulative_log_prob();
+            const auto logits = sequence->get_generated_log_probs();
 
             finish_info.results.tokens.push_back(sequence->get_generated_ids());
             finish_info.results.scores.push_back(score);
+            finish_info.results.logits.push_back(logits);
         }
     }
 

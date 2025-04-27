@@ -266,6 +266,7 @@ EncodedResults StatefulLLMPipeline::generate(
     results.scores.resize(1u);
     results.scores[0] = 0u;
     results.tokens.resize(1u);
+    results.logits.resize(1u);
 
     // NB: Check if there is enough space in KV-cache to process input prompt
     auto prompt_len = input_ids.get_size();
@@ -355,6 +356,7 @@ EncodedResults StatefulLLMPipeline::generate(
     auto sequence = sequence_group->get_finished_sequences().front();
     results.tokens[0] = sequence->get_generated_ids();
     results.scores[0] = sequence->get_cumulative_log_prob();
+    results.logits[0] = sequence->get_generated_log_probs();
     m_chat_generation_finish_status = sequence_group->get_generation_stream()->get_status();
     m_sampler.clear_request_info(sequence_group->get_request_id());
 

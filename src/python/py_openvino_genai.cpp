@@ -119,6 +119,7 @@ PYBIND11_MODULE(py_openvino_genai, m) {
     py::class_<EncodedResults>(m, "EncodedResults", encoded_results_docstring)
         .def_readonly("tokens", &EncodedResults::tokens)
         .def_readonly("scores", &EncodedResults::scores)
+        .def_readonly("logits", &EncodedResults::logits)
         .def_readonly("perf_metrics", &EncodedResults::perf_metrics)
         .def_readonly("extended_perf_metrics", &EncodedResults::extended_perf_metrics);
 
