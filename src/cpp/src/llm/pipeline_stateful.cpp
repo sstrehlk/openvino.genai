@@ -346,7 +346,8 @@ EncodedResults StatefulLLMPipeline::generate(
     }
 
     // Stateful pipeline does not provide logprobs for prompt tokens
-    OPENVINO_ASSERT(config.echo == false, "Echo is not supported in the stateful pipeline");
+    // FIXME_SHJI: echo could be supported if not enable SLICE_OUT when device is NPU.... but another problem is what about GPU?
+    // OPENVINO_ASSERT(config.echo == false, "Echo is not supported in the stateful pipeline");
 
     std::shared_ptr<StreamerBase> streamer_ptr = ov::genai::utils::create_streamer(streamer, m_tokenizer);
 
