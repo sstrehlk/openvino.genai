@@ -124,6 +124,10 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
 
     ov::Shape prompts_shape = input_ids.get_shape();
     const size_t batch_size = prompts_shape[0];
+    for (auto& sequence_group : sequence_groups) {
+        sequence_group->schedule_tokens(sequence_group->get_prompt_len());
+    }
+    const bool echo_enabled = sequence_groups[0]->get_sampling_parameters().echo;
 
     // Initialize results and performance metrics.
 
@@ -159,18 +163,31 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     raw_perf_counters.m_inference_durations[0] += MicroSeconds(infer_ms);
     raw_perf_counters.m_token_infer_durations.emplace_back(infer_ms);
 
-    auto logits = m_llm.get_tensor("logits");
+    ov::Tensor logits;
+    if (echo_enabled) {
+        auto prompt_logits = m_llm.get_tensor("logits");
+        ov::genai::utils::fill_prompt_log_probs(sequence_groups, prompt_logits);
 
+        // FIXME_SHJI: batch size should not only be 1 
+        OPENVINO_ASSERT(batch_size == 1);
+        size_t seq_len = prompt_logits.get_shape().at(1);
+        size_t vocab_size = prompt_logits.get_shape().at(2);
+        const float* last_token_data = prompt_logits.data<float>() + (seq_len - 1) * vocab_size;
+        logits = ov::Tensor(ov::element::f32, {batch_size, 1, vocab_size}, 
+                                const_cast<float*>(last_token_data));
+    } else {
+        logits = m_llm.get_tensor("logits");
+    }
+    
     int64_t output_sequence_len = logits.get_shape().at(1);
     for (auto& sequence_group : sequence_groups) {
-        sequence_group->schedule_tokens(sequence_group->get_prompt_len());
         sequence_group->set_output_seq_len(output_sequence_len);
     }
 
     std::map<size_t, size_t> beam_offets;
     for (size_t i = 0; i < sequence_groups.size(); i++)
         beam_offets.insert({sequence_groups.at(i)->get_request_id(), i});
-
+    
     SamplerOutput sampler_output = sampler.sample(sequence_groups, logits);
     free_non_running_requests(); // handle sampler output
 
@@ -293,13 +310,24 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
         finish_info.streaming_finish_status = sequence_group->get_generation_stream()->get_status();
 
         for (size_t seq_id = 0; seq_id < num_outputs; ++seq_id) {
-            const auto & sequence = sequences[seq_id];
+            const auto& sequence = sequences[seq_id];
             const float score = sampling_params.is_beam_search() ? sequence->get_beam_search_score(sampling_params) : sequence->get_cumulative_log_prob();
-            const auto logits = sequence->get_generated_log_probs();
+            const auto& generated_ids = sequence->get_generated_ids();
+            const auto& generated_log_probs = sequence->get_generated_log_probs();
+            
+            if (echo_enabled) {
+                std::vector<int64_t> token_ids = sequence_group->get_prompt_ids();
+                token_ids.insert(token_ids.end(), generated_ids.begin(), generated_ids.end());
+                finish_info.results.tokens.push_back(token_ids);
 
-            finish_info.results.tokens.push_back(sequence->get_generated_ids());
+                std::vector<float> log_probs = sequence_group->get_prompt_log_probs();
+                log_probs.insert(log_probs.end(), generated_log_probs.begin(), generated_log_probs.end());
+                finish_info.results.logits.push_back(log_probs);
+            } else {
+                finish_info.results.tokens.push_back(generated_ids);
+                finish_info.results.logits.push_back(generated_log_probs);
+            }
             finish_info.results.scores.push_back(score);
-            finish_info.results.logits.push_back(logits);
         }
     }
 

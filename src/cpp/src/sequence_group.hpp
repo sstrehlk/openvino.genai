@@ -717,6 +717,10 @@ public:
         m_prompt_log_probs.push_back(log_prob);
     }
 
+    std::vector<float> get_prompt_log_probs() {
+        return m_prompt_log_probs;
+    }
+
     SequenceGroupType get_sequence_group_type() const {
         return m_sequence_group_type;
     }
