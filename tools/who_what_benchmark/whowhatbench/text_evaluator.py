@@ -101,7 +101,8 @@ class TextEvaluator(BaseEvaluator):
 
         self.test_data = test_data
         self.metrics = metrics
-        self.max_new_tokens = 1 if "choice_similarity" in metrics else max_new_tokens 
+        # self.max_new_tokens = 1 if "choice_similarity" in metrics else max_new_tokens 
+        self.max_new_tokens = 10 if "choice_similarity" in metrics else max_new_tokens 
         self.tokenizer = tokenizer
         self._crop_question = crop_question
         self.num_samples = num_samples
