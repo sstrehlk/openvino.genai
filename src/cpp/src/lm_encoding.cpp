@@ -322,10 +322,10 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
 
                 std::vector<float> log_probs = sequence_group->get_prompt_log_probs();
                 log_probs.insert(log_probs.end(), generated_log_probs.begin(), generated_log_probs.end());
-                finish_info.results.logits.push_back(log_probs);
+                finish_info.results.log_probs.push_back(log_probs);
             } else {
                 finish_info.results.tokens.push_back(generated_ids);
-                finish_info.results.logits.push_back(generated_log_probs);
+                finish_info.results.log_probs.push_back(generated_log_probs);
             }
             finish_info.results.scores.push_back(score);
         }
