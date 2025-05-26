@@ -31,8 +31,8 @@ struct EncodedGenerationResult {
     std::vector<std::vector<int64_t>> m_generation_ids;
     // scores
     std::vector<float> m_scores;
-    // logits
-    std::vector<std::vector<float>> m_logits;
+    // logprobs
+    std::vector<std::vector<float>> m_log_probs;
 
     // Status of generation
     GenerationStatus m_status = GenerationStatus::RUNNING;
