@@ -129,6 +129,11 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     }
     const bool echo_enabled = sequence_groups[0]->get_sampling_parameters().echo;
 
+    std::cerr << "[DEBUG lm_encoding] echo_enabled=" << echo_enabled 
+              << ", max_new_tokens=" << sequence_groups[0]->get_max_new_tokens() 
+              << ", prompt_len=" << sequence_groups[0]->get_prompt_len() << std::endl;
+    std::cerr.flush();
+
     // Initialize results and performance metrics.
 
     ov::genai::utils::GenerationFinishInfo finish_info;
