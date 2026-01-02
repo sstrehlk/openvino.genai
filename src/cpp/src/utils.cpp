@@ -146,6 +146,10 @@ void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov:
 
         const float* sequence_group_logits_data = logits_data + vocab_size * currently_processed_tokens;
 
+        std::cout << "[DEBUG fill_prompt_log_probs] prompt_len=" << prompt_len 
+                  << ", vocab_size=" << vocab_size 
+                  << ", will iterate " << (prompt_len - 1) << " times" << std::endl;
+
         // Logits at position i predict token at position i+1
         // So we iterate to prompt_len-1 and use offset+1 for token_id
         for (int offset = 0; offset < prompt_len - 1; offset++) {
@@ -170,7 +174,14 @@ void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov:
             }));
 
             sequence_group->append_prompt_log_prob(token_logit - max_value - log_sum);
+            
+            if (offset < 3) {  // Print first 3 for debug
+                std::cout << "[DEBUG] offset=" << offset << ", token_id=" << token_id 
+                          << ", log_prob=" << (token_logit - max_value - log_sum) << std::endl;
+            }
         }
+
+        std::cout << "[DEBUG] After loop, appended " << (prompt_len - 1) << " log_probs" << std::endl;
 
         currently_processed_tokens += prompt_len * num_running_sequences;
         // For max_new_tokens == 0, we don't reach sampling so need to notify handle separately
