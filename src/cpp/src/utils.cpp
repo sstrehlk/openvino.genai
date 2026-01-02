@@ -146,9 +146,11 @@ void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov:
 
         const float* sequence_group_logits_data = logits_data + vocab_size * currently_processed_tokens;
 
-        for (int offset = 0; offset < prompt_len; offset++) {
+        // Logits at position i predict token at position i+1
+        // So we iterate to prompt_len-1 and use offset+1 for token_id
+        for (int offset = 0; offset < prompt_len - 1; offset++) {
             const float* token_logits = (sequence_group_logits_data + offset * vocab_size);
-            int64_t token_id = sequence_group->get_prompt_ids()[offset];
+            int64_t token_id = sequence_group->get_prompt_ids()[offset + 1];  // Next token
             float token_logit = token_logits[token_id]; 
 
             // find max value for log softmax
