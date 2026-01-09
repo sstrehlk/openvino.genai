@@ -6,6 +6,7 @@
 
 #include "lora/helper.hpp"
 #include "lm_encoding.hpp"
+#include "openvino/genai/llm_pipeline.hpp"
 #include "openvino/genai/text_streamer.hpp"
 
 #include "utils.hpp"
@@ -54,9 +55,17 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         m_use_full_chat_history = true;
     }
 
+    // Check if slice optimization should be disabled (needed for echo mode)
+    bool disable_slice = false;
+    auto it = properties.find(ov::genai::disable_slice_optimization.name());
+    if (it != properties.end()) {
+        disable_slice = it->second.as<bool>();
+    }
+
     // FIXME: slicing produces incorrect results for some models on NPU.
     // On NPU, applying slice the safe way is done by the underlying plugin
-    if (!m_is_npu) {
+    // Also skip slice if disabled via property (needed for echo with full logits)
+    if (!m_is_npu && !disable_slice) {
         utils::apply_slice_before_matmul_transformation(model);
     }
 
@@ -66,7 +75,10 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         m_kv_cache_state.seq_length_axis = kv_pos.seq_len;
 
     auto [filtered_properties_without_gguf, enable_save_ov_model] = utils::extract_gguf_properties(properties);
-    auto filtered_properties = extract_adapters_from_properties(filtered_properties_without_gguf, &m_generation_config.adapters);
+    // Filter out disable_slice_optimization property before passing to adapters and compilation
+    ov::AnyMap filtered_props_temp = filtered_properties_without_gguf;
+    filtered_props_temp.erase(ov::genai::disable_slice_optimization.name());
+    auto filtered_properties = extract_adapters_from_properties(filtered_props_temp, &m_generation_config.adapters);
     if (m_generation_config.adapters) {
         m_generation_config.adapters->set_tensor_name_prefix("base_model.model.");
         m_adapter_controller = AdapterController(model, *m_generation_config.adapters, device);   // TODO: Make the prefix name configurable
