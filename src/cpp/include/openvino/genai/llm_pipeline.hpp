@@ -400,6 +400,14 @@ static constexpr ov::Property<bool> prompt_lookup{"prompt_lookup"};
 */
 static constexpr ov::Property<bool> enable_save_ov_model{"enable_save_ov_model"};
 
+/**
+* @brief disable_slice_optimization disables the slice-before-matmul optimization in StatefulLLMPipeline.
+* This optimization improves performance by slicing logits to only the last token, but prevents echo mode from working.
+* Set `true` to disable the optimization and enable echo mode with full logits output.
+* Default is `false` (optimization enabled).
+*/
+static constexpr ov::Property<bool> disable_slice_optimization{"disable_slice_optimization"};
+
 
 }  // namespace genai
 }  // namespace ov
