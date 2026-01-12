@@ -134,7 +134,10 @@ void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov:
     const float * logits_data = logits.data<float>();
     ov::Shape logits_shape = logits.get_shape();
     OPENVINO_ASSERT(logits_shape.size() == 3);
+    size_t batch_size = logits_shape[0];
+    size_t seq_len = logits_shape[1];
     size_t vocab_size = logits_shape[2];
+    
     for (size_t sequence_group_id = 0, currently_processed_tokens = 0; sequence_group_id < sequence_groups.size(); ++sequence_group_id) {
         SequenceGroup::Ptr sequence_group = sequence_groups[sequence_group_id];
         if (!sequence_group->get_sampling_parameters().echo)
@@ -143,11 +146,22 @@ void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov:
         size_t num_running_sequences = sequence_group->num_running_seqs();
         OPENVINO_ASSERT(num_running_sequences == 1);
         size_t prompt_len = sequence_group->get_prompt_len();
+        
+        // Echo mode requires full logits (disable_slice_optimization=True)
+        // Check if we have enough logits positions for all prompt tokens
+        if (seq_len < prompt_len) {
+            std::stringstream error_msg;
+            error_msg << "Echo mode requires logits for all prompt tokens. "
+                     << "Got logits shape [" << batch_size << ", " << seq_len << ", " << vocab_size << "] "
+                     << "but prompt_len=" << prompt_len << ". "
+                     << "Please set disable_slice_optimization=True when creating LLMPipeline.";
+            OPENVINO_THROW(error_msg.str());
+        }
 
         const float* sequence_group_logits_data = logits_data + vocab_size * currently_processed_tokens;
 
         for (int offset = 0; offset < prompt_len; offset++) {
-            // log_probs[i] should be log P(token_{i+1} | logits at position i)
+            // log_probs[i] should be log P(token_i | logits at position i-1)
             // So to compute log_prob for token at position 'offset', we use logits from position 'offset-1'
             // Special case: for offset=0 (first token), we use logits from position 0
             int logits_position = (offset == 0) ? 0 : offset - 1;
