@@ -4,6 +4,10 @@
 
 #include "llm/pipeline_stateful.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
 #include "lora/helper.hpp"
 #include "lm_encoding.hpp"
 #include "openvino/genai/llm_pipeline.hpp"
@@ -508,6 +512,71 @@ void StatefulLLMPipeline::finish_chat() {
         m_tokenized_chat_history.clear();
         m_kv_cache_state.reset_state();
     }
+}
+
+std::vector<float> StatefulLLMPipeline::get_next_token_log_probs(
+    const std::string& prompt,
+    const std::vector<int64_t>& token_ids
+) {
+    // Tokenize the prompt
+    ov::Tensor input_ids = m_tokenizer.encode(prompt).input_ids;
+    size_t prompt_len = input_ids.get_shape().at(1);
+    size_t batch_size = input_ids.get_shape().at(0);
+    
+    // Reset KV cache state before inference
+    reset_kv_state();
+    
+    // Set inputs
+    m_model_runner.set_tensor("input_ids", input_ids);
+    ov::Tensor attention_mask = ov::Tensor{ov::element::i64, input_ids.get_shape()};
+    std::fill_n(attention_mask.data<int64_t>(), attention_mask.get_size(), 1);
+    m_model_runner.set_tensor("attention_mask", attention_mask);
+    
+    // Set beam_idx tensor (required for KV cache)
+    ov::Tensor beam_idx = ov::Tensor{ov::element::i32, {batch_size}};
+    std::fill_n(beam_idx.data<int32_t>(), batch_size, 0);
+    m_model_runner.set_tensor("beam_idx", beam_idx);
+    
+    // Run inference
+    m_model_runner.infer();
+    
+    // Get logits from the last position
+    ov::Tensor logits_tensor = m_model_runner.get_tensor("logits");
+    auto logits_shape = logits_tensor.get_shape();
+    const float* logits_data = logits_tensor.data<const float>();
+    size_t vocab_size = logits_shape.back();
+    
+    // Get the actual sequence length from logits shape (might be 1 if only last token returned)
+    size_t logits_seq_len = logits_shape[1];
+    
+    // Logits for the last token position (use logits shape, not prompt length)
+    const float* last_position_logits = logits_data + (logits_seq_len - 1) * vocab_size;
+    
+    // Apply softmax to get probabilities, then log
+    std::vector<float> result;
+    result.reserve(token_ids.size());
+    
+    // First find max for numerical stability
+    float max_logit = *std::max_element(last_position_logits, last_position_logits + vocab_size);
+    
+    // Compute sum of exp(logit - max_logit) for normalization
+    float sum_exp = 0.0f;
+    for (size_t i = 0; i < vocab_size; ++i) {
+        sum_exp += std::exp(last_position_logits[i] - max_logit);
+    }
+    float log_sum_exp = std::log(sum_exp) + max_logit;
+    
+    // For each requested token, compute log probability
+    for (int64_t token_id : token_ids) {
+        if (token_id < 0 || static_cast<size_t>(token_id) >= vocab_size) {
+            result.push_back(-std::numeric_limits<float>::infinity());
+        } else {
+            float log_prob = last_position_logits[token_id] - log_sum_exp;
+            result.push_back(log_prob);
+        }
+    }
+    
+    return result;
 }
 
 StatefulLLMPipeline::~StatefulLLMPipeline() {
