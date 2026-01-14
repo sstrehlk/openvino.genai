@@ -266,6 +266,7 @@ EncodedResults StatefulLLMPipeline::generate(
     results.scores.resize(1u);
     results.scores[0] = 0u;
     results.tokens.resize(1u);
+    results.log_probs.resize(1u);
 
     // NB: Check if there is enough space in KV-cache to process input prompt
     auto prompt_len = input_ids.get_size();
@@ -355,6 +356,7 @@ EncodedResults StatefulLLMPipeline::generate(
     auto sequence = sequence_group->get_finished_sequences().front();
     results.tokens[0] = sequence->get_generated_ids();
     results.scores[0] = sequence->get_cumulative_log_prob();
+    results.log_probs[0] = sequence->get_generated_log_probs();
     m_chat_generation_finish_status = sequence_group->get_generation_stream()->get_status();
     m_sampler.clear_request_info(sequence_group->get_request_id());
 
@@ -381,6 +383,13 @@ void StatefulLLMPipeline::finish_chat() {
     m_is_chat_conversation = false;
     m_history.clear();
 };
+
+std::vector<float> StatefulLLMPipeline::get_next_token_log_probs(
+    const std::string& prompt,
+    const std::vector<int64_t>& token_ids
+) {
+    OPENVINO_THROW("get_next_token_log_probs is not yet implemented for static pipeline");
+}
 
 StatefulLLMPipeline::~StatefulLLMPipeline() {
     m_request.get_compiled_model().release_memory();

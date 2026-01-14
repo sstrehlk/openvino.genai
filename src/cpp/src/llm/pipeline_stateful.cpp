@@ -4,8 +4,14 @@
 
 #include "llm/pipeline_stateful.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <iostream>
+
 #include "lora/helper.hpp"
 #include "lm_encoding.hpp"
+#include "openvino/genai/llm_pipeline.hpp"
 #include "openvino/genai/text_streamer.hpp"
 
 #include "utils.hpp"
@@ -54,9 +60,18 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         m_use_full_chat_history = true;
     }
 
-    // FIXME: slicing produces incorrect results for some models on NPU.
+    // Check if slice optimization should be disabled (needed for echo mode)
+    bool disable_slice = false;
+    auto it = properties.find(ov::genai::disable_slice_optimization.name());
+    if (it != properties.end()) {
+        disable_slice = it->second.as<bool>();
+    }
+
+    // slicing produces incorrect log_prob results
+    // (used during accuracy check with llm-evaluation-harness), so disable it in this case
     // On NPU, applying slice the safe way is done by the underlying plugin
-    if (!m_is_npu) {
+    // Also skip slice if disabled via property (needed for echo with full logits)
+    if (!m_is_npu && !disable_slice) {
         utils::apply_slice_before_matmul_transformation(model);
     }
 
@@ -66,7 +81,10 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         m_kv_cache_state.seq_length_axis = kv_pos.seq_len;
 
     auto [filtered_properties_without_gguf, enable_save_ov_model] = utils::extract_gguf_properties(properties);
-    auto filtered_properties = extract_adapters_from_properties(filtered_properties_without_gguf, &m_generation_config.adapters);
+    // Filter out disable_slice_optimization property before passing to adapters and compilation
+    ov::AnyMap filtered_props_temp = filtered_properties_without_gguf;
+    filtered_props_temp.erase(ov::genai::disable_slice_optimization.name());
+    auto filtered_properties = extract_adapters_from_properties(filtered_props_temp, &m_generation_config.adapters);
     if (m_generation_config.adapters) {
         m_generation_config.adapters->set_tensor_name_prefix("base_model.model.");
         m_adapter_controller = AdapterController(model, *m_generation_config.adapters, device);   // TODO: Make the prefix name configurable
@@ -345,8 +363,8 @@ EncodedResults StatefulLLMPipeline::generate(
             "Currently only \"num_return_sequences\" equal to 1 is supported for NPU device!");
     }
 
-    // Stateful pipeline does not provide logprobs for prompt tokens
-    OPENVINO_ASSERT(config.echo == false, "Echo is not supported in the stateful pipeline");
+    // echo could be supported if not enable SLICE_OUT
+    // OPENVINO_ASSERT(config.echo == false, "Echo is not supported in the stateful pipeline");
 
     std::shared_ptr<StreamerBase> streamer_ptr = ov::genai::utils::create_streamer(streamer, m_tokenizer);
 
@@ -495,6 +513,110 @@ void StatefulLLMPipeline::finish_chat() {
         m_tokenized_chat_history.clear();
         m_kv_cache_state.reset_state();
     }
+}
+
+std::vector<float> StatefulLLMPipeline::get_next_token_log_probs(
+    const std::string& prompt,
+    const std::vector<int64_t>& token_ids
+) {
+    // Tokenize the full prompt
+    ov::Tensor prompt_ids = m_tokenizer.encode(prompt).input_ids;
+    size_t prompt_len = prompt_ids.get_shape().at(1);
+    
+    // Create generation config with echo mode (max_new_tokens=0)
+    // This will return log_probs for all prompt tokens
+    GenerationConfig echo_config;
+    echo_config.max_new_tokens = 0;  // Echo mode: don't generate, just compute log_probs
+    echo_config.echo = true;  // Enable echo mode to get log_probs for prompt
+    echo_config.do_sample = false;
+    echo_config.num_return_sequences = 1;
+    
+    // Generate with echo mode - this uses the same path as echo mode in Python
+    std::monostate empty_streamer;  // No streaming needed
+    EncodedResults encoded_results = generate(prompt_ids, echo_config, empty_streamer);
+    
+    // Extract log_probs from the result
+    // log_probs[i] = log P(token[i+1] | tokens[0:i])
+    // So log_probs[prompt_len-1] = log P(next token | full prompt)
+    const std::vector<float>& all_log_probs = encoded_results.log_probs[0];
+    
+   
+    if (all_log_probs.size() < prompt_len) {
+        std::cerr << "[ERROR] Not enough log_probs from echo mode!" << std::endl;
+        return std::vector<float>(token_ids.size(), -1.0f);
+    }
+    
+    // Reset KV cache to ensure clean state
+    reset_kv_state();
+    
+    // Process the prompt through the model using the same preprocessing as generate()
+    // Set inputs
+    m_model_runner.set_tensor("input_ids", prompt_ids);
+    
+    // Set attention mask (all 1s for full prompt)
+    ov::Tensor attention_mask = ov::Tensor{ov::element::i64, prompt_ids.get_shape()};
+    std::fill_n(attention_mask.data<int64_t>(), attention_mask.get_size(), 1);
+    m_model_runner.set_tensor("attention_mask", attention_mask);
+    
+    // Initialize position_ids if the model expects them (same as generate() does)
+    try {
+        size_t num_inputs = m_model_runner.get_compiled_model().inputs().size();
+        if (num_inputs == 4) {  // Model expects position_ids
+            ov::Tensor position_ids = ov::Tensor{ov::element::i64, prompt_ids.get_shape()};
+            utils::initialize_position_ids(position_ids, attention_mask, 0);  // start_pos=0 since KV cache is empty
+            m_model_runner.set_tensor("position_ids", position_ids);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[DEBUG] Could not initialize position_ids: " << e.what() << std::endl;
+    }
+    
+    // Set beam_idx
+    size_t batch_size = prompt_ids.get_shape().at(0);
+    ov::Tensor beam_idx = ov::Tensor{ov::element::i32, {batch_size}};
+    std::fill_n(beam_idx.data<int32_t>(), batch_size, 0);
+    m_model_runner.set_tensor("beam_idx", beam_idx);
+    
+    // Run inference
+    m_model_runner.infer();
+
+    // Get logits
+    ov::Tensor logits_tensor = m_model_runner.get_tensor("logits");
+    auto logits_shape = logits_tensor.get_shape();
+    const float* logits_data = logits_tensor.data<const float>();
+    size_t vocab_size = logits_shape.back();
+    size_t logits_seq_len = logits_shape[1];
+
+    // Use the LAST position's logits (predicts what comes after prompt)
+    size_t logits_pos = logits_seq_len - 1;
+    const float* position_logits = logits_data + logits_pos * vocab_size;
+
+    // Compute log_probs for each requested token
+    std::vector<float> result;
+    result.reserve(token_ids.size());
+
+    // Pre-compute log softmax normalization (shared across all tokens)
+    float max_val = -std::numeric_limits<float>::infinity();
+    for (size_t j = 0; j < vocab_size; ++j) {
+        if (position_logits[j] > max_val) {
+            max_val = position_logits[j];
+        }
+    }
+
+    double log_sum = 0.0;
+    for (size_t j = 0; j < vocab_size; ++j) {
+        log_sum += std::exp(position_logits[j] - max_val);
+    }
+    log_sum = std::log(log_sum);
+
+    // Compute log_prob for each continuation token
+    for (size_t i = 0; i < token_ids.size(); ++i) {
+        int64_t cont_token = token_ids[i];
+        float raw_logit = position_logits[cont_token];
+        float log_prob = raw_logit - max_val - static_cast<float>(log_sum);
+
+        result.push_back(log_prob);
+    }
+    return result;
 }
 
 StatefulLLMPipeline::~StatefulLLMPipeline() {
