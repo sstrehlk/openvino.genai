@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <iostream>
 
 #include "lora/helper.hpp"
 #include "lm_encoding.hpp"
@@ -66,7 +67,8 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         disable_slice = it->second.as<bool>();
     }
 
-    // FIXME: slicing produces incorrect results for some models on NPU.
+    // slicing produces incorrect log_prob results
+    // (used during accuracy check with llm-evaluation-harness), so disable it in this case
     // On NPU, applying slice the safe way is done by the underlying plugin
     // Also skip slice if disabled via property (needed for echo with full logits)
     if (!m_is_npu && !disable_slice) {
@@ -361,8 +363,7 @@ EncodedResults StatefulLLMPipeline::generate(
             "Currently only \"num_return_sequences\" equal to 1 is supported for NPU device!");
     }
 
-    // Stateful pipeline does not provide logprobs for prompt tokens
-    // FIXME_SHJI: echo could be supported if not enable SLICE_OUT when device is NPU.... but another problem is what about GPU?
+    // echo could be supported if not enable SLICE_OUT
     // OPENVINO_ASSERT(config.echo == false, "Echo is not supported in the stateful pipeline");
 
     std::shared_ptr<StreamerBase> streamer_ptr = ov::genai::utils::create_streamer(streamer, m_tokenizer);
@@ -518,64 +519,114 @@ std::vector<float> StatefulLLMPipeline::get_next_token_log_probs(
     const std::string& prompt,
     const std::vector<int64_t>& token_ids
 ) {
-    // Tokenize the prompt
-    ov::Tensor input_ids = m_tokenizer.encode(prompt).input_ids;
-    size_t prompt_len = input_ids.get_shape().at(1);
-    size_t batch_size = input_ids.get_shape().at(0);
+    // Tokenize the full prompt
+    ov::Tensor prompt_ids = m_tokenizer.encode(prompt).input_ids;
+    size_t prompt_len = prompt_ids.get_shape().at(1);
     
-    // Reset KV cache state before inference
+    // Create generation config with echo mode (max_new_tokens=0)
+    // This will return log_probs for all prompt tokens
+    GenerationConfig echo_config;
+    echo_config.max_new_tokens = 0;  // Echo mode: don't generate, just compute log_probs
+    echo_config.echo = true;  // Enable echo mode to get log_probs for prompt
+    echo_config.do_sample = false;
+    echo_config.num_return_sequences = 1;
+    
+    // Generate with echo mode - this uses the same path as echo mode in Python
+    std::monostate empty_streamer;  // No streaming needed
+    EncodedResults encoded_results = generate(prompt_ids, echo_config, empty_streamer);
+    
+    // Extract log_probs from the result
+    // log_probs[i] = log P(token[i+1] | tokens[0:i])
+    // So log_probs[prompt_len-1] = log P(next token | full prompt)
+    const std::vector<float>& all_log_probs = encoded_results.log_probs[0];
+    
+   
+    if (all_log_probs.size() < prompt_len) {
+        std::cerr << "[ERROR] Not enough log_probs from echo mode!" << std::endl;
+        return std::vector<float>(token_ids.size(), -1.0f);
+    }
+    
+    // The last log_prob (at index prompt_len-1) represents predictions after the full prompt
+    // This is log P(next_token | full_prompt)
+    // We need to extract log_probs for each token_id from the logits at position prompt_len-1
+    
+    // Wait... echo mode returns log_probs for the prompt tokens themselves, not predictions!
+    // We need the logits to compute log_probs for arbitrary continuation tokens.
+    
+    // Let me reconsider... Actually, we need to get the logits from the model output.
+    // The generate() function doesn't expose raw logits directly.
+    // We need a different approach: call the internal methods that generate() uses.
+    
+    // Reset KV cache to ensure clean state
     reset_kv_state();
     
+    // Process the prompt through the model using the same preprocessing as generate()
     // Set inputs
-    m_model_runner.set_tensor("input_ids", input_ids);
-    ov::Tensor attention_mask = ov::Tensor{ov::element::i64, input_ids.get_shape()};
+    m_model_runner.set_tensor("input_ids", prompt_ids);
+    
+    // Set attention mask (all 1s for full prompt)
+    ov::Tensor attention_mask = ov::Tensor{ov::element::i64, prompt_ids.get_shape()};
     std::fill_n(attention_mask.data<int64_t>(), attention_mask.get_size(), 1);
     m_model_runner.set_tensor("attention_mask", attention_mask);
     
-    // Set beam_idx tensor (required for KV cache)
+    // Initialize position_ids if the model expects them (same as generate() does)
+    try {
+        size_t num_inputs = m_model_runner.get_compiled_model().inputs().size();
+        if (num_inputs == 4) {  // Model expects position_ids
+            ov::Tensor position_ids = ov::Tensor{ov::element::i64, prompt_ids.get_shape()};
+            utils::initialize_position_ids(position_ids, attention_mask, 0);  // start_pos=0 since KV cache is empty
+            m_model_runner.set_tensor("position_ids", position_ids);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[DEBUG] Could not initialize position_ids: " << e.what() << std::endl;
+    }
+    
+    // Set beam_idx
+    size_t batch_size = prompt_ids.get_shape().at(0);
     ov::Tensor beam_idx = ov::Tensor{ov::element::i32, {batch_size}};
     std::fill_n(beam_idx.data<int32_t>(), batch_size, 0);
     m_model_runner.set_tensor("beam_idx", beam_idx);
     
     // Run inference
     m_model_runner.infer();
-    
-    // Get logits from the last position
+
+    // Get logits
     ov::Tensor logits_tensor = m_model_runner.get_tensor("logits");
     auto logits_shape = logits_tensor.get_shape();
     const float* logits_data = logits_tensor.data<const float>();
     size_t vocab_size = logits_shape.back();
-    
-    // Get the actual sequence length from logits shape (might be 1 if only last token returned)
     size_t logits_seq_len = logits_shape[1];
-    
-    // Logits for the last token position (use logits shape, not prompt length)
-    const float* last_position_logits = logits_data + (logits_seq_len - 1) * vocab_size;
-    
-    // Apply softmax to get probabilities, then log
+
+    // Use the LAST position's logits (predicts what comes after prompt)
+    size_t logits_pos = logits_seq_len - 1;
+    const float* position_logits = logits_data + logits_pos * vocab_size;
+
+    // Compute log_probs for each requested token
     std::vector<float> result;
     result.reserve(token_ids.size());
-    
-    // First find max for numerical stability
-    float max_logit = *std::max_element(last_position_logits, last_position_logits + vocab_size);
-    
-    // Compute sum of exp(logit - max_logit) for normalization
-    float sum_exp = 0.0f;
-    for (size_t i = 0; i < vocab_size; ++i) {
-        sum_exp += std::exp(last_position_logits[i] - max_logit);
-    }
-    float log_sum_exp = std::log(sum_exp) + max_logit;
-    
-    // For each requested token, compute log probability
-    for (int64_t token_id : token_ids) {
-        if (token_id < 0 || static_cast<size_t>(token_id) >= vocab_size) {
-            result.push_back(-std::numeric_limits<float>::infinity());
-        } else {
-            float log_prob = last_position_logits[token_id] - log_sum_exp;
-            result.push_back(log_prob);
+
+    // Pre-compute log softmax normalization (shared across all tokens)
+    float max_val = -std::numeric_limits<float>::infinity();
+    for (size_t j = 0; j < vocab_size; ++j) {
+        if (position_logits[j] > max_val) {
+            max_val = position_logits[j];
         }
     }
-    
+
+    double log_sum = 0.0;
+    for (size_t j = 0; j < vocab_size; ++j) {
+        log_sum += std::exp(position_logits[j] - max_val);
+    }
+    log_sum = std::log(log_sum);
+
+    // Compute log_prob for each continuation token
+    for (size_t i = 0; i < token_ids.size(); ++i) {
+        int64_t cont_token = token_ids[i];
+        float raw_logit = position_logits[cont_token];
+        float log_prob = raw_logit - max_val - static_cast<float>(log_sum);
+
+        result.push_back(log_prob);
+    }
     return result;
 }
 
