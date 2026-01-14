@@ -335,7 +335,6 @@ public:
     *   prompt = "What is 2+2?\nA. 3\nB. 4\nC. 5\nD. 6\nAnswer:"
     *   token_ids = [tokenizer.encode(" A")[0], tokenizer.encode(" B")[0], ...]
     *   log_probs = pipeline.get_next_token_log_probs(prompt, token_ids)
-    *   // log_probs[i] is the log probability that token_ids[i] follows the prompt
     */
     std::vector<float> get_next_token_log_probs(
         const std::string& prompt,
