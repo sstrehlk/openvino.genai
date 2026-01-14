@@ -168,7 +168,6 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
         auto prompt_logits = m_llm.get_tensor("logits");
         ov::genai::utils::fill_prompt_log_probs(sequence_groups, prompt_logits);
 
-        // FIXME_SHJI: batch size should not only be 1 
         OPENVINO_ASSERT(batch_size == 1);
         size_t seq_len = prompt_logits.get_shape().at(1);
         size_t vocab_size = prompt_logits.get_shape().at(2);
@@ -178,7 +177,7 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     } else {
         logits = m_llm.get_tensor("logits");
     }
-    
+
     int64_t output_sequence_len = logits.get_shape().at(1);
     for (auto& sequence_group : sequence_groups) {
         sequence_group->set_output_seq_len(output_sequence_len);
