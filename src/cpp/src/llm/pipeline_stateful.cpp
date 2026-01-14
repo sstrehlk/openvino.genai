@@ -546,17 +546,6 @@ std::vector<float> StatefulLLMPipeline::get_next_token_log_probs(
         return std::vector<float>(token_ids.size(), -1.0f);
     }
     
-    // The last log_prob (at index prompt_len-1) represents predictions after the full prompt
-    // This is log P(next_token | full_prompt)
-    // We need to extract log_probs for each token_id from the logits at position prompt_len-1
-    
-    // Wait... echo mode returns log_probs for the prompt tokens themselves, not predictions!
-    // We need the logits to compute log_probs for arbitrary continuation tokens.
-    
-    // Let me reconsider... Actually, we need to get the logits from the model output.
-    // The generate() function doesn't expose raw logits directly.
-    // We need a different approach: call the internal methods that generate() uses.
-    
     // Reset KV cache to ensure clean state
     reset_kv_state();
     
