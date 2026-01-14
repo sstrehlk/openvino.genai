@@ -167,7 +167,6 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     if (echo_enabled) {
         auto prompt_logits = m_llm.get_tensor("logits");
         ov::genai::utils::fill_prompt_log_probs(sequence_groups, prompt_logits);
-
         OPENVINO_ASSERT(batch_size == 1);
         size_t seq_len = prompt_logits.get_shape().at(1);
         size_t vocab_size = prompt_logits.get_shape().at(2);
@@ -186,7 +185,7 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     std::map<size_t, size_t> beam_offets;
     for (size_t i = 0; i < sequence_groups.size(); i++)
         beam_offets.insert({sequence_groups.at(i)->get_request_id(), i});
-    
+
     SamplerOutput sampler_output = sampler.sample(sequence_groups, logits);
     free_non_running_requests(); // handle sampler output
 
@@ -194,7 +193,6 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     raw_perf_counters.m_batch_sizes.emplace_back(sampler_output.num_generated_tokens);
 
     // "Generation" phase
-
     while (!active_sequence_groups.empty()) {
         size_t total_num_tokens = 0;
 
