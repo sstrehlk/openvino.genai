@@ -308,8 +308,20 @@ def load_prompts(args):
         name = None
     data = load_dataset(path=path, name=name, split=split)
 
-    res = data[args.dataset_field]
-    res = {"prompts": list(res)}
+    if 'mmlu' in path:
+        args.dataset_field = "question"
+        questions = data[args.dataset_field][:args.num_samples]
+        choices = data['choices'][:args.num_samples]
+        questions_with_choices = []
+        for question, choice_set in zip(questions, choices):
+            formatted_choices = "\n".join([f"{chr(65 + i)}. {option}" for i, option in enumerate(choice_set)])
+            full_prompt = f"Question:\n{question}\n\nChoices:\n{formatted_choices}\n"
+            questions_with_choices.append(full_prompt)
+        res = {"prompts": questions_with_choices}
+    else:
+        res = data[args.dataset_field][:args.num_samples]
+        res = {"prompts": list(res)}
+
     return res
 
 
