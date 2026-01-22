@@ -92,7 +92,7 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     ov::CompiledModel compiled_model;
     if (m_is_npu) {
         utils::KVDesc kv_desc;
-        std::tie(compiled_model, kv_desc) = utils::compile_decoder_for_npu(model, *filtered_properties, kv_pos);
+        std::tie(compiled_model, kv_desc) = utils::compile_decoder_for_npu(model, *filtered_properties, kv_pos, false, disable_slice);
         m_max_prompt_len = kv_desc.max_prompt_len;
         m_max_kv_cache_size = kv_desc.max_prompt_len + kv_desc.min_response_len;
     } else {

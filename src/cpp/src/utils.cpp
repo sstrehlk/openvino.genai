@@ -640,7 +640,8 @@ std::pair<ov::CompiledModel, KVDesc>
 compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
                         const ov::AnyMap& config,
                         const KVAxesPosition& kv_pos,
-                        const bool is_whisper) {
+                        const bool is_whisper,
+                        const bool disable_slice_optimization) {
     ov::CompiledModel compiled;
     ov::AnyMap properties = config;
     KVDesc kv_desc;
@@ -670,6 +671,10 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
             kv_desc.max_prompt_len = pop_int_and_cast(properties, "MAX_PROMPT_LEN").value_or(1024u);
             kv_desc.min_response_len = pop_int_and_cast(properties, "MIN_RESPONSE_LEN").value_or(128u);
             update_npu_config(properties, kv_pos, kv_desc);
+        }
+        // Disable logits slicing for echo mode to get log probs for all prompt tokens
+        if (disable_slice_optimization) {
+            update_config(properties, {"NPUW_SLICE_OUT", "NO"});
         }
         compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
         // Also export compiled model if required
