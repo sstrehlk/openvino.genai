@@ -147,9 +147,14 @@ void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov:
         OPENVINO_ASSERT(num_running_sequences == 1);
         size_t prompt_len = sequence_group->get_prompt_len();
         
+        std::cout << "[UTILS DEBUG] Echo mode processing: batch_size=" << batch_size 
+                  << ", seq_len=" << seq_len << ", vocab_size=" << vocab_size 
+                  << ", prompt_len=" << prompt_len << std::endl;
+        
         // Echo mode requires full logits (disable_slice_optimization=True)
         // Check if we have enough logits positions for all prompt tokens
         if (seq_len < prompt_len) {
+            std::cout << "[UTILS ERROR] seq_len < prompt_len! This means logits were sliced despite disable_slice_optimization=True!" << std::endl;
             std::stringstream error_msg;
             error_msg << "Echo mode requires logits for all prompt tokens. "
                      << "Got logits shape [" << batch_size << ", " << seq_len << ", " << vocab_size << "] "

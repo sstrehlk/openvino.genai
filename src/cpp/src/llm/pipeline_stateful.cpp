@@ -55,9 +55,14 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     const ov::AnyMap& properties,
     const ov::genai::GenerationConfig& generation_config)
     : LLMPipelineImplBase(tokenizer, generation_config), m_sampler(m_tokenizer) {
+    std::cout << "[PIPELINE DEBUG] StatefulLLMPipeline constructor called with device='" << device << "'" << std::endl;
+    
     if (device.find("NPU") != std::string::npos) {
         m_is_npu = true;
         m_use_full_chat_history = true;
+        std::cout << "[PIPELINE DEBUG] NPU detected in device name, m_is_npu=true" << std::endl;
+    } else {
+        std::cout << "[PIPELINE DEBUG] NPU not detected in device name, m_is_npu=false" << std::endl;
     }
 
     // Check if slice optimization should be disabled (needed for echo mode)
@@ -65,14 +70,22 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     auto it = properties.find(ov::genai::disable_slice_optimization.name());
     if (it != properties.end()) {
         disable_slice = it->second.as<bool>();
+        std::cout << "[PIPELINE DEBUG] Found disable_slice_optimization property=" << (disable_slice ? "TRUE" : "FALSE") << std::endl;
+    } else {
+        std::cout << "[PIPELINE DEBUG] disable_slice_optimization property NOT found, using default=FALSE" << std::endl;
     }
 
     // slicing produces incorrect log_prob results
     // (used during accuracy check with llm-evaluation-harness), so disable it in this case
     // On NPU, applying slice the safe way is done by the underlying plugin
     // Also skip slice if disabled via property (needed for echo with full logits)
+    std::cout << "[PIPELINE DEBUG] Slice optimization decision: m_is_npu=" << m_is_npu 
+              << ", disable_slice=" << disable_slice << std::endl;
     if (!m_is_npu && !disable_slice) {
+        std::cout << "[PIPELINE DEBUG] ❌ APPLYING slice_before_matmul transformation (THIS BREAKS ECHO MODE!)" << std::endl;
         utils::apply_slice_before_matmul_transformation(model);
+    } else {
+        std::cout << "[PIPELINE DEBUG] ✅ SKIPPING slice_before_matmul transformation (echo mode will work)" << std::endl;
     }
 
     auto kv_pos = ov::genai::utils::get_kv_axes_pos(model);
@@ -519,9 +532,15 @@ std::vector<float> StatefulLLMPipeline::get_next_token_log_probs(
     const std::string& prompt,
     const std::vector<int64_t>& token_ids
 ) {
+    std::cout << "[GET_NEXT_TOKEN DEBUG] Called with prompt length=" << prompt.length() 
+              << ", " << token_ids.size() << " continuation tokens" << std::endl;
+    std::cout << "[GET_NEXT_TOKEN DEBUG] m_is_npu=" << m_is_npu << std::endl;
+    
     // Tokenize the full prompt
     ov::Tensor prompt_ids = m_tokenizer.encode(prompt).input_ids;
     size_t prompt_len = prompt_ids.get_shape().at(1);
+    
+    std::cout << "[GET_NEXT_TOKEN DEBUG] Tokenized prompt_len=" << prompt_len << std::endl;
     
     // Create generation config with echo mode (max_new_tokens=0)
     // This will return log_probs for all prompt tokens
@@ -531,18 +550,24 @@ std::vector<float> StatefulLLMPipeline::get_next_token_log_probs(
     echo_config.do_sample = false;
     echo_config.num_return_sequences = 1;
     
+    std::cout << "[GET_NEXT_TOKEN DEBUG] Calling generate() with echo mode..." << std::endl;
+    
     // Generate with echo mode - this uses the same path as echo mode in Python
     std::monostate empty_streamer;  // No streaming needed
     EncodedResults encoded_results = generate(prompt_ids, echo_config, empty_streamer);
+    
+    std::cout << "[GET_NEXT_TOKEN DEBUG] generate() returned, checking log_probs..." << std::endl;
     
     // Extract log_probs from the result
     // log_probs[i] = log P(token[i+1] | tokens[0:i])
     // So log_probs[prompt_len-1] = log P(next token | full prompt)
     const std::vector<float>& all_log_probs = encoded_results.log_probs[0];
     
+    std::cout << "[GET_NEXT_TOKEN DEBUG] all_log_probs.size()=" << all_log_probs.size() 
+              << ", expected prompt_len=" << prompt_len << std::endl;
    
     if (all_log_probs.size() < prompt_len) {
-        std::cerr << "[ERROR] Not enough log_probs from echo mode!" << std::endl;
+        std::cerr << "[GET_NEXT_TOKEN ERROR] Not enough log_probs from echo mode!" << std::endl;
         return std::vector<float>(token_ids.size(), -1.0f);
     }
     
