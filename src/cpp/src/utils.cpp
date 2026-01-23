@@ -642,6 +642,9 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
                         const KVAxesPosition& kv_pos,
                         const bool is_whisper,
                         const bool disable_slice_optimization) {
+    std::cout << "[NPU DEBUG] compile_decoder_for_npu called with disable_slice_optimization=" 
+              << (disable_slice_optimization ? "TRUE" : "FALSE") << std::endl;
+    
     ov::CompiledModel compiled;
     ov::AnyMap properties = config;
     KVDesc kv_desc;
@@ -649,8 +652,13 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
     auto blob_path = pop_or_default(properties, "BLOB_PATH", std::string{});
     const auto export_blob = pop_or_default(properties, "EXPORT_BLOB", false);
     const bool do_import = (!blob_path.empty() && !export_blob);
+    
+    std::cout << "[NPU DEBUG] blob_path=" << (blob_path.empty() ? "<empty>" : blob_path) 
+              << ", export_blob=" << (export_blob ? "TRUE" : "FALSE")
+              << ", do_import=" << (do_import ? "TRUE" : "FALSE") << std::endl;
 
     if (do_import) {
+        std::cout << "[NPU DEBUG] Importing model from blob: " << blob_path << std::endl;
         if (!std::filesystem::exists(blob_path)) {
             OPENVINO_THROW("Blob file is not found at: " + blob_path);
         }
@@ -661,7 +669,9 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
         compiled = ov::genai::utils::singleton_core().import_model(fin, "NPU", config);
         kv_desc.max_prompt_len = compiled.get_property("NPUW_LLM_MAX_PROMPT_LEN").as<uint32_t>();
         kv_desc.min_response_len = compiled.get_property("NPUW_LLM_MIN_RESPONSE_LEN").as<uint32_t>();
+        std::cout << "[NPU DEBUG] Blob imported successfully" << std::endl;
     } else {
+        std::cout << "[NPU DEBUG] Compiling model from scratch (not using blob)" << std::endl;
         if (is_whisper) {
             kv_desc.max_prompt_len = pop_int_and_cast(properties, "MAX_PROMPT_LEN").value_or(4u);
             // kvcache size for Whisper = 448u (MAX_PROMPT_LEN + MIN_RESPONSE_LEN)
@@ -674,9 +684,18 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
         }
         // Disable logits slicing for echo mode to get log probs for all prompt tokens
         if (disable_slice_optimization) {
+            std::cout << "[NPU DEBUG] Disabling slice optimization - setting NPUW_SLICE_OUT=NO" << std::endl;
             update_config(properties, {"NPUW_SLICE_OUT", "NO"});
+            // Also disable slicing in PREFILL and GENERATE configs
+            std::cout << "[NPU DEBUG] Adding NPUW_SLICE_OUT=NO to PREFILL and GENERATE configs" << std::endl;
+            update_config(properties, {"++NPUW_LLM_PREFILL_CONFIG", "NPUW_SLICE_OUT=NO"});
+            update_config(properties, {"++NPUW_LLM_GENERATE_CONFIG", "NPUW_SLICE_OUT=NO"});
+        } else {
+            std::cout << "[NPU DEBUG] Slice optimization is ENABLED (disable_slice_optimization=false)" << std::endl;
         }
+        std::cout << "[NPU DEBUG] Starting model compilation..." << std::endl;
         compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
+        std::cout << "[NPU DEBUG] Model compiled successfully" << std::endl;
         // Also export compiled model if required
         if (export_blob) {
             if (blob_path.empty()) {
