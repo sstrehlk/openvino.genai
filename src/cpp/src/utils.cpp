@@ -686,10 +686,6 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
         if (disable_slice_optimization) {
             std::cout << "[NPU DEBUG] Disabling slice optimization - setting NPUW_SLICE_OUT=NO" << std::endl;
             update_config(properties, {"NPUW_SLICE_OUT", "NO"});
-            // Also disable slicing in PREFILL and GENERATE configs
-            std::cout << "[NPU DEBUG] Adding NPUW_SLICE_OUT=NO to PREFILL and GENERATE configs" << std::endl;
-            update_config(properties, {"++NPUW_LLM_PREFILL_CONFIG", "NPUW_SLICE_OUT=NO"});
-            update_config(properties, {"++NPUW_LLM_GENERATE_CONFIG", "NPUW_SLICE_OUT=NO"});
         } else {
             std::cout << "[NPU DEBUG] Slice optimization is ENABLED (disable_slice_optimization=false)" << std::endl;
         }
