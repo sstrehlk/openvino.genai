@@ -649,6 +649,15 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
     ov::AnyMap properties = config;
     KVDesc kv_desc;
 
+    // Check for OpenVINO cache dir (automatic caching)
+    auto cache_dir_it = properties.find("CACHE_DIR");
+    if (cache_dir_it != properties.end()) {
+        std::cout << "[NPU DEBUG] OpenVINO CACHE_DIR is set to: " << cache_dir_it->second.as<std::string>() << std::endl;
+        std::cout << "[NPU DEBUG] WARNING: Cached models may have old NPUW_SLICE_OUT setting!" << std::endl;
+    } else {
+        std::cout << "[NPU DEBUG] No CACHE_DIR set - no automatic model caching" << std::endl;
+    }
+
     auto blob_path = pop_or_default(properties, "BLOB_PATH", std::string{});
     const auto export_blob = pop_or_default(properties, "EXPORT_BLOB", false);
     const bool do_import = (!blob_path.empty() && !export_blob);
