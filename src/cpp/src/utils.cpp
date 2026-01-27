@@ -703,6 +703,18 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
         } else {
             std::cout << "[NPU DEBUG] Slice optimization is ENABLED (disable_slice_optimization=false)" << std::endl;
         }
+        
+        // Debug: print model input/output shapes BEFORE compilation
+        std::cout << "[NPU DEBUG] MODEL SHAPES BEFORE COMPILATION:" << std::endl;
+        for (const auto& input : model->inputs()) {
+            std::cout << "[NPU DEBUG]   Input '" << input.get_any_name() << "': " 
+                      << input.get_partial_shape() << std::endl;
+        }
+        for (const auto& output : model->outputs()) {
+            std::cout << "[NPU DEBUG]   Output '" << output.get_any_name() << "': " 
+                      << output.get_partial_shape() << std::endl;
+        }
+        
         std::cout << "[NPU DEBUG] Starting model compilation..." << std::endl;
         compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
         std::cout << "[NPU DEBUG] Model compiled successfully" << std::endl;
