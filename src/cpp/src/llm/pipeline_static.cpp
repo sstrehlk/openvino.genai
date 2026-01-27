@@ -110,8 +110,15 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     const ov::genai::GenerationConfig& generation_config
 ) : LLMPipelineImplBase(tokenizer, generation_config),
     m_sampler(m_tokenizer) {
+    std::cout << "[PIPELINE_STATIC DEBUG] Constructor called with echo=" 
+              << (generation_config.echo ? "TRUE" : "FALSE") << std::endl;
     auto kv_pos = ov::genai::utils::get_kv_axes_pos(model);
-    auto [compiled, kv_desc] = utils::compile_decoder_for_npu(model, properties, kv_pos);
+    // For echo mode, disable slice optimization to get logits for all prompt tokens
+    auto [compiled, kv_desc] = utils::compile_decoder_for_npu(
+        model, properties, kv_pos, 
+        false,  // is_whisper
+        generation_config.echo  // disable_slice_optimization
+    );
     m_max_prompt_len = kv_desc.max_prompt_len;
     m_kvcache_total = kv_desc.max_prompt_len + kv_desc.min_response_len;
     m_request = compiled.create_infer_request();
@@ -286,21 +293,52 @@ EncodedResults StatefulLLMPipeline::generate(
     m_request.infer();
 
     auto padded_logits = m_request.get_tensor("logits");
-    // FIXME: Here is workaround to get only useful units of returned logits.
-    //        If SliceOut is applied, there will be only 1 useful logit returned,
-    //        nothing is required here.
-    //        Other way, model will return logits of full context length,
-    //        as internally prefill model is specially reshaped to return them.
-    //        Fix should be done on OpenVINO side, so the model should return only
-    //        useful logits of input prompt length, dropping the implementation-related
-    //        padding ones.
     auto logits = padded_logits;
     auto padded_sequence_len = padded_logits.get_shape()[1];
-    if (padded_sequence_len > 1) {
-        // If SliceOut is not applied:
-        logits = make_tensor_slice(padded_logits, 1, padded_sequence_len - prompt_len, padded_sequence_len);
+    
+    std::cout << "[PIPELINE_STATIC DEBUG] After infer: padded_logits.shape=[" 
+              << padded_logits.get_shape()[0] << "," 
+              << padded_logits.get_shape()[1] << "," 
+              << padded_logits.get_shape()[2] << "], prompt_len=" << prompt_len 
+              << ", echo=" << (config.echo ? "TRUE" : "FALSE") << std::endl;
+    
+    // In echo mode, we need logits for all prompt tokens, so don't slice
+    if (config.echo) {
+        // Echo mode: model should return [1, prompt_len, vocab] or [1, max_prompt_len, vocab]
+        // We need to keep logits for the first prompt_len positions
+        if (padded_sequence_len > prompt_len) {
+            std::cout << "[PIPELINE_STATIC DEBUG] Echo mode: slicing [0:" << prompt_len 
+                      << "] from padded_sequence_len=" << padded_sequence_len << std::endl;
+            // Model returned padded logits [1, max_prompt_len, vocab]
+            // Take only the first prompt_len logits: [0:prompt_len]
+            logits = make_tensor_slice(padded_logits, 1, 0, prompt_len);
+        } else {
+            std::cout << "[PIPELINE_STATIC DEBUG] Echo mode: no slicing needed, " 
+                      << "padded_sequence_len=" << padded_sequence_len 
+                      << " <= prompt_len=" << prompt_len << std::endl;
+        }
+        // else: model returned exactly [1, prompt_len, vocab], use as-is
+    } else {
+        // Normal generation mode: we only need the last logit
+        if (padded_sequence_len > 1) {
+            std::cout << "[PIPELINE_STATIC DEBUG] Normal mode: slicing [" 
+                      << (padded_sequence_len - prompt_len) << ":" << padded_sequence_len 
+                      << "]" << std::endl;
+            // Model returned [1, max_prompt_len, vocab]
+            // Take only the last logit: [max_prompt_len-prompt_len : max_prompt_len]
+            logits = make_tensor_slice(padded_logits, 1, padded_sequence_len - prompt_len, padded_sequence_len);
+        } else {
+            std::cout << "[PIPELINE_STATIC DEBUG] Normal mode: no slicing needed, " 
+                      << "padded_sequence_len=1 (SliceOut was applied)" << std::endl;
+        }
+        // else: model returned [1, 1, vocab] (SliceOut was applied), use as-is
     }
     int64_t output_sequence_len = logits.get_shape().at(1);
+    
+    std::cout << "[PIPELINE_STATIC DEBUG] Final logits.shape=[" 
+              << logits.get_shape()[0] << "," 
+              << logits.get_shape()[1] << "," 
+              << logits.get_shape()[2] << "], output_sequence_len=" << output_sequence_len << std::endl;
 
     auto sequence_group = std::make_shared<SequenceGroup>(
         0 /* request_id */, input_ids, config, 1 /* block_size */);
