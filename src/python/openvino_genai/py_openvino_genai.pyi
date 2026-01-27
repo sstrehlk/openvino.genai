@@ -601,6 +601,7 @@ class EncodedGenerationResult:
         generation_ids:     in a generic case we have multiple generation results per initial prompt
             depending on sampling parameters (e.g. beam search or parallel sampling).
         scores:             scores.
+        log_probs:          log probabilities.
         status:             status of generation. The following values are possible:
             RUNNING = 0 - Default status for ongoing generation.
             FINISHED = 1 - Status set when generation has been finished.
@@ -622,6 +623,12 @@ class EncodedGenerationResult:
         ...
     @m_generation_ids.setter
     def m_generation_ids(self, arg0: collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt]]) -> None:
+        ...
+    @property
+    def m_log_probs(self) -> list[list[float]]:
+        ...
+    @m_log_probs.setter
+    def m_log_probs(self, arg0: collections.abc.Sequence[collections.abc.Sequence[typing.SupportsFloat]]) -> None:
         ...
     @property
     def m_request_id(self) -> int:
@@ -647,6 +654,7 @@ class EncodedResults:
         Parameters: 
         tokens: sequence of resulting tokens.
         scores: sum of logarithmic probabilities of all tokens in the sequence.
+        log_probs: logarithmic probabilities of all tokens in the sequence.
         metrics: performance metrics with tpot, ttft, etc. of type ov::genai::PerfMetrics.
         extended_perf_metrics: performance pipeline specifics metrics,
                                applicable for pipelines with implemented extended metrics: SpeculativeDecoding Pipeline.
@@ -659,6 +667,9 @@ class EncodedResults:
         ...
     @property
     def scores(self) -> list[float]:
+        ...
+    @property
+    def log_probs(self) -> list[list[float]]:
         ...
     @property
     def tokens(self) -> list[list[int]]:

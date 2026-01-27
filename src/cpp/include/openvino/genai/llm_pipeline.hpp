@@ -37,6 +37,7 @@ using StringInputs = std::variant<std::string, std::vector<std::string>>;
 *
 * @param tokens sequence of resulting tokens
 * @param scores sum of logarithmic probabilities of all tokens in the sequence
+* @param log_probs log probabilities of all tokens in the sequence
 * @param perf_metrics performance metrics with tpot, ttft, etc. of type ov::genai::PerfMetrics
 * @param extended_perf_metrics pipeline specific performance metrics etc. of type ov::genai::PerfMetrics.
 *        Applicable for pipelines with implemented extended metrics: SpeculativeDecoding Pipeline.
@@ -47,6 +48,7 @@ class EncodedResults {
 public:
     std::vector<std::vector<int64_t>> tokens;
     std::vector<float> scores;
+    std::vector<std::vector<float>> log_probs;
     PerfMetrics perf_metrics;
     std::shared_ptr<ExtendedPerfMetrics> extended_perf_metrics;
 };
@@ -319,6 +321,26 @@ public:
     }
     EncodedResults generate(const EncodedInputs& inputs, const ov::AnyMap& config_map);
 
+    /**
+    * @brief Get log probabilities for specific tokens after processing the prompt.
+    * This method processes the input prompt and returns log probabilities for the specified token IDs
+    * that would follow the prompt. Useful for multiple-choice tasks where you need to compare
+    * probabilities of different continuations.
+    *
+    * @param prompt The input text prompt
+    * @param token_ids Vector of token IDs to get log probabilities for
+    * @return Vector of log probabilities corresponding to each token ID
+    * 
+    * Example usage for MMLU-style multiple choice:
+    *   prompt = "What is 2+2?\nA. 3\nB. 4\nC. 5\nD. 6\nAnswer:"
+    *   token_ids = [tokenizer.encode(" A")[0], tokenizer.encode(" B")[0], ...]
+    *   log_probs = pipeline.get_next_token_log_probs(prompt, token_ids)
+    */
+    std::vector<float> get_next_token_log_probs(
+        const std::string& prompt,
+        const std::vector<int64_t>& token_ids
+    );
+
     ov::genai::Tokenizer get_tokenizer();
     GenerationConfig get_generation_config() const;
     void set_generation_config(const GenerationConfig& config);
@@ -397,6 +419,14 @@ static constexpr ov::Property<bool> prompt_lookup{"prompt_lookup"};
 * And create LLMPipeline instance with this config.
 */
 static constexpr ov::Property<bool> enable_save_ov_model{"enable_save_ov_model"};
+
+/**
+* @brief disable_slice_optimization disables the slice-before-matmul optimization in StatefulLLMPipeline.
+* This optimization improves performance by slicing logits to only the last token, but prevents echo mode from working.
+* Set `true` to disable the optimization and enable echo mode with full logits output.
+* Default is `false` (optimization enabled).
+*/
+static constexpr ov::Property<bool> disable_slice_optimization{"disable_slice_optimization"};
 
 
 }  // namespace genai

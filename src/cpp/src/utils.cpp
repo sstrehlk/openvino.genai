@@ -130,6 +130,77 @@ namespace ov {
 namespace genai {
 namespace utils {
 
+void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov::Tensor& logits) {
+    const float * logits_data = logits.data<float>();
+    ov::Shape logits_shape = logits.get_shape();
+    OPENVINO_ASSERT(logits_shape.size() == 3);
+    size_t batch_size = logits_shape[0];
+    size_t seq_len = logits_shape[1];
+    size_t vocab_size = logits_shape[2];
+    
+    for (size_t sequence_group_id = 0, currently_processed_tokens = 0; sequence_group_id < sequence_groups.size(); ++sequence_group_id) {
+        SequenceGroup::Ptr sequence_group = sequence_groups[sequence_group_id];
+        if (!sequence_group->get_sampling_parameters().echo)
+            continue;
+
+        size_t num_running_sequences = sequence_group->num_running_seqs();
+        OPENVINO_ASSERT(num_running_sequences == 1);
+        size_t prompt_len = sequence_group->get_prompt_len();
+        
+        std::cout << "[UTILS DEBUG] Echo mode processing: batch_size=" << batch_size 
+                  << ", seq_len=" << seq_len << ", vocab_size=" << vocab_size 
+                  << ", prompt_len=" << prompt_len << std::endl;
+        
+        // Echo mode requires full logits (disable_slice_optimization=True)
+        // Check if we have enough logits positions for all prompt tokens
+        if (seq_len < prompt_len) {
+            std::cout << "[UTILS ERROR] seq_len < prompt_len! This means logits were sliced despite disable_slice_optimization=True!" << std::endl;
+            std::stringstream error_msg;
+            error_msg << "Echo mode requires logits for all prompt tokens. "
+                     << "Got logits shape [" << batch_size << ", " << seq_len << ", " << vocab_size << "] "
+                     << "but prompt_len=" << prompt_len << ". "
+                     << "Please set disable_slice_optimization=True when creating LLMPipeline.";
+            OPENVINO_THROW(error_msg.str());
+        }
+
+        const float* sequence_group_logits_data = logits_data + vocab_size * currently_processed_tokens;
+
+        for (int offset = 0; offset < prompt_len; offset++) {
+            // log_probs[i] should be log P(token_i | logits at position i-1)
+            // So to compute log_prob for token at position 'offset', we use logits from position 'offset-1'
+            // Special case: for offset=0 (first token), we use logits from position 0
+            int logits_position = (offset == 0) ? 0 : offset - 1;
+            const float* token_logits = (sequence_group_logits_data + logits_position * vocab_size);
+            int64_t token_id = sequence_group->get_prompt_ids()[offset];
+            float token_logit = token_logits[token_id];
+
+            // find max value for log softmax
+            float max_value = -std::numeric_limits<float>::infinity();
+            size_t max_index = 0;
+            for (size_t i = 0; i < vocab_size; ++i) {
+                if (token_logits[i] > max_value) {
+                    max_value = token_logits[i];
+                    max_index = i;
+                }
+            }
+
+            // apply log softmax to token logit
+            float log_sum = std::log(std::accumulate(
+                token_logits, token_logits + vocab_size, 0.0f, [max_value](float accumulated, float to_add) {
+                    return accumulated + std::exp(to_add - max_value);
+            }));
+
+            sequence_group->append_prompt_log_prob(token_logit - max_value - log_sum);
+        }
+
+        currently_processed_tokens += prompt_len * num_running_sequences;
+        // For max_new_tokens == 0, we don't reach sampling so need to notify handle separately
+        if(sequence_group->get_max_new_tokens() == 0) {
+            sequence_group->notify_handle_echo_only();
+        }
+    }
+}
+
 Tensor init_attention_mask(const Tensor& input_ids) {
     auto shape = input_ids.get_shape();
     auto attention_mask = ov::Tensor{input_ids.get_element_type(), shape};
@@ -574,16 +645,34 @@ std::pair<ov::CompiledModel, KVDesc>
 compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
                         const ov::AnyMap& config,
                         const KVAxesPosition& kv_pos,
-                        const bool is_whisper) {
+                        const bool is_whisper,
+                        const bool disable_slice_optimization) {
+    std::cout << "[NPU DEBUG] compile_decoder_for_npu called with disable_slice_optimization=" 
+              << (disable_slice_optimization ? "TRUE" : "FALSE") << std::endl;
+    
     ov::CompiledModel compiled;
     ov::AnyMap properties = config;
     KVDesc kv_desc;
 
+    // Check for OpenVINO cache dir (automatic caching)
+    auto cache_dir_it = properties.find("CACHE_DIR");
+    if (cache_dir_it != properties.end()) {
+        std::cout << "[NPU DEBUG] OpenVINO CACHE_DIR is set to: " << cache_dir_it->second.as<std::string>() << std::endl;
+        std::cout << "[NPU DEBUG] WARNING: Cached models may have old NPUW_SLICE_OUT setting!" << std::endl;
+    } else {
+        std::cout << "[NPU DEBUG] No CACHE_DIR set - no automatic model caching" << std::endl;
+    }
+
     auto blob_path = pop_or_default(properties, "BLOB_PATH", std::string{});
     const auto export_blob = pop_or_default(properties, "EXPORT_BLOB", false);
     const bool do_import = (!blob_path.empty() && !export_blob);
+    
+    std::cout << "[NPU DEBUG] blob_path=" << (blob_path.empty() ? "<empty>" : blob_path) 
+              << ", export_blob=" << (export_blob ? "TRUE" : "FALSE")
+              << ", do_import=" << (do_import ? "TRUE" : "FALSE") << std::endl;
 
     if (do_import) {
+        std::cout << "[NPU DEBUG] Importing model from blob: " << blob_path << std::endl;
         if (!std::filesystem::exists(blob_path)) {
             OPENVINO_THROW("Blob file is not found at: " + blob_path);
         }
@@ -594,7 +683,9 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
         compiled = ov::genai::utils::singleton_core().import_model(fin, "NPU", config);
         kv_desc.max_prompt_len = compiled.get_property("NPUW_LLM_MAX_PROMPT_LEN").as<uint32_t>();
         kv_desc.min_response_len = compiled.get_property("NPUW_LLM_MIN_RESPONSE_LEN").as<uint32_t>();
+        std::cout << "[NPU DEBUG] Blob imported successfully" << std::endl;
     } else {
+        std::cout << "[NPU DEBUG] Compiling model from scratch (not using blob)" << std::endl;
         if (is_whisper) {
             kv_desc.max_prompt_len = pop_int_and_cast(properties, "MAX_PROMPT_LEN").value_or(4u);
             // kvcache size for Whisper = 448u (MAX_PROMPT_LEN + MIN_RESPONSE_LEN)
@@ -605,7 +696,28 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
             kv_desc.min_response_len = pop_int_and_cast(properties, "MIN_RESPONSE_LEN").value_or(128u);
             update_npu_config(properties, kv_pos, kv_desc);
         }
+        // Disable logits slicing for echo mode to get log probs for all prompt tokens
+        if (disable_slice_optimization) {
+            std::cout << "[NPU DEBUG] Disabling slice optimization - setting NPUW_SLICE_OUT=NO" << std::endl;
+            update_config(properties, {"NPUW_SLICE_OUT", "NO"});
+        } else {
+            std::cout << "[NPU DEBUG] Slice optimization is ENABLED (disable_slice_optimization=false)" << std::endl;
+        }
+        
+        // Debug: print model input/output shapes BEFORE compilation
+        std::cout << "[NPU DEBUG] MODEL SHAPES BEFORE COMPILATION:" << std::endl;
+        for (const auto& input : model->inputs()) {
+            std::cout << "[NPU DEBUG]   Input '" << input.get_any_name() << "': " 
+                      << input.get_partial_shape() << std::endl;
+        }
+        for (const auto& output : model->outputs()) {
+            std::cout << "[NPU DEBUG]   Output '" << output.get_any_name() << "': " 
+                      << output.get_partial_shape() << std::endl;
+        }
+        
+        std::cout << "[NPU DEBUG] Starting model compilation..." << std::endl;
         compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
+        std::cout << "[NPU DEBUG] Model compiled successfully" << std::endl;
         // Also export compiled model if required
         if (export_blob) {
             if (blob_path.empty()) {
