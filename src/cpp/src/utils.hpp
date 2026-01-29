@@ -18,6 +18,7 @@
 #include "visual_language/processor_config.hpp"
 
 #include "openvino/genai/streamer_base.hpp"
+#include "sequence_group.hpp"
 
 namespace ov {
 namespace genai {
@@ -76,6 +77,8 @@ struct GenerationFinishInfo
     EncodedResults results;
     GenerationStatus streaming_finish_status;
 };
+
+void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov::Tensor& logits);
 
 Tensor init_attention_mask(const Tensor& position_ids);
 

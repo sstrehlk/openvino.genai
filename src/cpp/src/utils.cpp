@@ -145,6 +145,91 @@ namespace ov {
 namespace genai {
 namespace utils {
 
+void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov::Tensor& logits) {
+    const float * logits_data = logits.data<float>();
+    ov::Shape logits_shape = logits.get_shape();
+    OPENVINO_ASSERT(logits_shape.size() == 3);
+    size_t batch_size = logits_shape[0];
+    size_t seq_len = logits_shape[1];
+    size_t vocab_size = logits_shape[2];
+    
+    for (size_t sequence_group_id = 0, currently_processed_tokens = 0; sequence_group_id < sequence_groups.size(); ++sequence_group_id) {
+        SequenceGroup::Ptr sequence_group = sequence_groups[sequence_group_id];
+        if (!sequence_group->get_sampling_parameters().echo)
+            continue;
+
+        size_t num_running_sequences = sequence_group->num_running_seqs();
+        OPENVINO_ASSERT(num_running_sequences == 1);
+        size_t prompt_len = sequence_group->get_prompt_len();
+        
+        std::cout << "[UTILS DEBUG] Echo mode processing: batch_size=" << batch_size 
+                  << ", seq_len=" << seq_len << ", vocab_size=" << vocab_size 
+                  << ", prompt_len=" << prompt_len << std::endl;
+        
+        // Note: This echo mode path is now legacy - use optimized get_next_token_log_probs() instead
+        // Check if we have enough logits positions for all prompt tokens
+        if (seq_len < prompt_len) {
+            std::cout << "[UTILS ERROR] seq_len < prompt_len! This means logits were sliced!" << std::endl;
+            std::stringstream error_msg;
+            error_msg << "Echo mode requires logits for all prompt tokens. "
+                     << "Got logits shape [" << batch_size << ", " << seq_len << ", " << vocab_size << "] "
+                     << "but prompt_len=" << prompt_len << ". "
+                     << "For slice optimization compatibility, use get_next_token_log_probs() instead.";
+            OPENVINO_THROW(error_msg.str());
+        }
+
+        const float* sequence_group_logits_data = logits_data + vocab_size * currently_processed_tokens;
+
+        std::cout << "[UTILS DEBUG] Processing prompt tokens: prompt_len=" << prompt_len 
+                  << ", available seq_len=" << seq_len << std::endl;
+
+        for (int offset = 0; offset < prompt_len; offset++) {
+            // log_probs[i] should be log P(token_i | logits at position i-1)
+            // So to compute log_prob for token at position 'offset', we use logits from position 'offset-1'
+            // Special case: for offset=0 (first token), we use logits from position 0
+            int logits_position = (offset == 0) ? 0 : offset - 1;
+            
+            if (logits_position >= static_cast<int>(seq_len)) {
+                std::cout << "[UTILS WARNING] Trying to access logits_position=" << logits_position 
+                          << " but seq_len=" << seq_len << " (position out of bounds!)" << std::endl;
+            }
+            
+            const float* token_logits = (sequence_group_logits_data + logits_position * vocab_size);
+            int64_t token_id = sequence_group->get_prompt_ids()[offset];
+            float token_logit = token_logits[token_id];
+            
+            if (offset < 3 || offset >= prompt_len - 3) {
+                std::cout << "[UTILS DEBUG] Token offset=" << offset << ", logits_position=" << logits_position 
+                          << ", token_id=" << token_id << ", logit_value=" << token_logit << std::endl;
+            }
+
+            // find max value for log softmax
+            float max_value = -std::numeric_limits<float>::infinity();
+            size_t max_index = 0;
+            for (size_t i = 0; i < vocab_size; ++i) {
+                if (token_logits[i] > max_value) {
+                    max_value = token_logits[i];
+                    max_index = i;
+                }
+            }
+
+            // apply log softmax to token logit
+            float log_sum = std::log(std::accumulate(
+                token_logits, token_logits + vocab_size, 0.0f, [max_value](float accumulated, float to_add) {
+                    return accumulated + std::exp(to_add - max_value);
+            }));
+
+            sequence_group->append_prompt_log_prob(token_logit - max_value - log_sum);
+        }
+
+        currently_processed_tokens += prompt_len * num_running_sequences;
+        // For max_new_tokens == 0, we don't reach sampling so need to notify handle separately
+        if(sequence_group->get_max_new_tokens() == 0) {
+            sequence_group->notify_handle_echo_only();
+        }
+    }
+}
+
 enum class ModelType { Default, Whisper, TextEmbedding };
 
 Tensor init_attention_mask(const Tensor& input_ids) {
@@ -676,6 +761,7 @@ std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_impl(const std::sha
         }
 
         compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
+        std::cout << "[NPU DEBUG] Model compiled successfully" << std::endl;
         // Also export compiled model if required
         if (export_blob) {
             if (blob_path.empty()) {
