@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2025 Intel Corporation
+// Copyright (C) 2023-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
 #include "utils.hpp"
@@ -116,6 +116,21 @@ void update_npu_config_whisper(ov::AnyMap& config,
     update_config(config, {"NPUW_LLM_PREFILL_HINT", "STATIC"});
 }
 
+void update_npu_config_text_embedding(ov::AnyMap& config,
+                                      const ov::genai::utils::KVAxesPosition& kv_pos,
+                                      const ov::genai::utils::KVDesc& kv_desc) {
+    update_config(config, {"NPU_USE_NPUW", "YES"});
+    update_config(config, {"NPUW_LLM", "YES"});
+    update_config(config, {"NPUW_LLM_BATCH_DIM", kv_pos.batch});
+    update_config(config, {"NPUW_LLM_SEQ_LEN_DIM", kv_pos.seq_len});
+
+    update_config(config, {"NPUW_LLM_MAX_PROMPT_LEN", kv_desc.max_prompt_len});
+    update_config(config, {"NPUW_LLM_MIN_RESPONSE_LEN", kv_desc.min_response_len});
+    update_config(config, {"NPUW_LLM_SHARED_HEAD", "NO"});
+
+    update_config(config, {"NPUW_TEXT_EMBED", "YES"});
+}
+
 inline bool is_paged_attention_available() {
 #if defined(OPENVINO_ARCH_X86_64) || defined(OPENVINO_ARCH_ARM64)
     return true;
@@ -215,6 +230,8 @@ void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov:
     }
 }
 
+enum class ModelType { Default, Whisper, TextEmbedding };
+
 Tensor init_attention_mask(const Tensor& input_ids) {
     auto shape = input_ids.get_shape();
     auto attention_mask = ov::Tensor{input_ids.get_element_type(), shape};
@@ -260,8 +277,6 @@ ov::genai::StreamerVariant get_streamer_from_map(const ov::AnyMap& config_map) {
         auto any_val = config_map.at(STREAMER_ARG_NAME);
         if (any_val.is<std::shared_ptr<ov::genai::StreamerBase>>()) {
             streamer = any_val.as<std::shared_ptr<ov::genai::StreamerBase>>();
-        } else if (any_val.is<std::function<bool(std::string)>>()) {
-            streamer = any_val.as<std::function<bool(std::string)>>();
         } else if (any_val.is<std::function<StreamingStatus(std::string)>>()) {
             streamer = any_val.as<std::function<StreamingStatus(std::string)>>();
         }
@@ -655,72 +670,96 @@ void print_scheduler_config_info(const SchedulerConfig &scheduler_config) {
     std::cout << scheduler_config.to_string() << std::endl;
 }
 
-std::pair<ov::CompiledModel, KVDesc>
-compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
-                        const ov::AnyMap& config,
-                        const KVAxesPosition& kv_pos,
-                        const bool is_whisper) {
-    std::cout << "[NPU DEBUG] compile_decoder_for_npu called (slice optimization handled by NPU plugin)" << std::endl;
-    
+void import_npu_model(ov::CompiledModel& compiled,
+                      KVDesc& kv_desc,
+                      const ov::AnyMap& config,
+                      const std::string& blob_path) {
+    if (!std::filesystem::exists(blob_path)) {
+        OPENVINO_THROW("Blob file is not found at: " + blob_path);
+    }
+    std::ifstream fin(blob_path, std::ios::in | std::ios::binary);
+    if (!fin.is_open()) {
+        OPENVINO_THROW("Blob file can't be opened: " + blob_path);
+    }
+    compiled = ov::genai::utils::singleton_core().import_model(fin, "NPU", config);
+    kv_desc.max_prompt_len = compiled.get_property("NPUW_LLM_MAX_PROMPT_LEN").as<uint32_t>();
+    kv_desc.min_response_len = compiled.get_property("NPUW_LLM_MIN_RESPONSE_LEN").as<uint32_t>();
+}
+
+void export_npu_model(ov::CompiledModel& compiled, const std::string& blob_path) {
+    // Check the path is full
+    const int EXT_SIZE = 5;  // ".blob"
+    if (blob_path.size() < EXT_SIZE) {
+        OPENVINO_THROW("Please provide a full path to blob file in BLOB_PATH: " + blob_path);
+    }
+    if (strncmp(&blob_path[blob_path.size() - EXT_SIZE], ".blob", EXT_SIZE) != 0) {
+        OPENVINO_THROW("Please provide a full path to blob file in BLOB_PATH: " + blob_path);
+    }
+    std::ofstream fout(blob_path, std::ios::out | std::ios::binary);
+    if (!fout.is_open()) {
+        OPENVINO_THROW("Blob file can't be exported to: " + blob_path);
+    }
+    compiled.export_model(fout);
+}
+
+void get_npu_model_config(ov::AnyMap& properties,
+                          const KVAxesPosition& kv_pos,
+                          KVDesc& kv_desc,
+                          const bool is_whisper) {
+    if (is_whisper) {
+        kv_desc.max_prompt_len = pop_int_and_cast(properties, "MAX_PROMPT_LEN").value_or(4u);
+        // kvcache size for Whisper = 448u (MAX_PROMPT_LEN + MIN_RESPONSE_LEN)
+        kv_desc.min_response_len = pop_int_and_cast(properties, "MIN_RESPONSE_LEN").value_or(444u);
+        update_npu_config_whisper(properties, kv_pos, kv_desc);
+    } else {
+        kv_desc.max_prompt_len = pop_int_and_cast(properties, "MAX_PROMPT_LEN").value_or(1024u);
+        kv_desc.min_response_len = pop_int_and_cast(properties, "MIN_RESPONSE_LEN").value_or(128u);
+        update_npu_config(properties, kv_pos, kv_desc);
+    }
+}
+
+void get_npu_text_embedding_config(ov::AnyMap& properties,
+                                   const KVAxesPosition& kv_pos,
+                                   KVDesc& kv_desc,
+                                   const TextEmbeddingPipeline::Config& text_embed_config) {
+    if (text_embed_config.max_length.has_value()) {
+        kv_desc.max_prompt_len = text_embed_config.max_length.value();
+    } else {
+        kv_desc.max_prompt_len = pop_int_and_cast(properties, "MAX_PROMPT_LEN").value_or(1024u);
+    }
+    kv_desc.min_response_len = kv_desc.max_prompt_len;
+    update_npu_config_text_embedding(properties, kv_pos, kv_desc);
+}
+
+std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_impl(const std::shared_ptr<ov::Model>& model,
+                                                                  const ov::AnyMap& config,
+                                                                  const KVAxesPosition& kv_pos,
+                                                                  ModelType model_type,
+                                                                  const TextEmbeddingPipeline::Config& text_embed_config = {}) {
     ov::CompiledModel compiled;
     ov::AnyMap properties = config;
     KVDesc kv_desc;
 
-    // Check for OpenVINO cache dir (automatic caching)
-    auto cache_dir_it = properties.find("CACHE_DIR");
-    if (cache_dir_it != properties.end()) {
-        std::cout << "[NPU DEBUG] OpenVINO CACHE_DIR is set to: " << cache_dir_it->second.as<std::string>() << std::endl;
-        std::cout << "[NPU DEBUG] WARNING: Cached models may have old NPUW_SLICE_OUT setting!" << std::endl;
-    } else {
-        std::cout << "[NPU DEBUG] No CACHE_DIR set - no automatic model caching" << std::endl;
-    }
-
     auto blob_path = pop_or_default(properties, "BLOB_PATH", std::string{});
     const auto export_blob = pop_or_default(properties, "EXPORT_BLOB", false);
     const bool do_import = (!blob_path.empty() && !export_blob);
-    
-    std::cout << "[NPU DEBUG] blob_path=" << (blob_path.empty() ? "<empty>" : blob_path) 
-              << ", export_blob=" << (export_blob ? "TRUE" : "FALSE")
-              << ", do_import=" << (do_import ? "TRUE" : "FALSE") << std::endl;
 
     if (do_import) {
-        std::cout << "[NPU DEBUG] Importing model from blob: " << blob_path << std::endl;
-        if (!std::filesystem::exists(blob_path)) {
-            OPENVINO_THROW("Blob file is not found at: " + blob_path);
-        }
-        std::ifstream fin(blob_path, std::ios::in | std::ios::binary);
-        if (!fin.is_open()) {
-            OPENVINO_THROW("Blob file can't be opened: " + blob_path);
-        }
-        compiled = ov::genai::utils::singleton_core().import_model(fin, "NPU", config);
-        kv_desc.max_prompt_len = compiled.get_property("NPUW_LLM_MAX_PROMPT_LEN").as<uint32_t>();
-        kv_desc.min_response_len = compiled.get_property("NPUW_LLM_MIN_RESPONSE_LEN").as<uint32_t>();
-        std::cout << "[NPU DEBUG] Blob imported successfully" << std::endl;
+        import_npu_model(compiled, kv_desc, properties, blob_path);
     } else {
-        std::cout << "[NPU DEBUG] Compiling model from scratch (not using blob)" << std::endl;
-        if (is_whisper) {
-            kv_desc.max_prompt_len = pop_int_and_cast(properties, "MAX_PROMPT_LEN").value_or(4u);
-            // kvcache size for Whisper = 448u (MAX_PROMPT_LEN + MIN_RESPONSE_LEN)
-            kv_desc.min_response_len = pop_int_and_cast(properties, "MIN_RESPONSE_LEN").value_or(444u);
-            update_npu_config_whisper(properties, kv_pos, kv_desc);
-        } else {
-            kv_desc.max_prompt_len = pop_int_and_cast(properties, "MAX_PROMPT_LEN").value_or(1024u);
-            kv_desc.min_response_len = pop_int_and_cast(properties, "MIN_RESPONSE_LEN").value_or(128u);
-            update_npu_config(properties, kv_pos, kv_desc);
+        switch (model_type) {
+        case ModelType::TextEmbedding:
+            get_npu_text_embedding_config(properties, kv_pos, kv_desc, text_embed_config);
+            break;
+        case ModelType::Whisper:
+            get_npu_model_config(properties, kv_pos, kv_desc, true);
+            break;
+        case ModelType::Default:
+        default:
+            get_npu_model_config(properties, kv_pos, kv_desc, false);
+            break;
         }
-        
-        // Debug: print model input/output shapes BEFORE compilation
-        std::cout << "[NPU DEBUG] MODEL SHAPES BEFORE COMPILATION:" << std::endl;
-        for (const auto& input : model->inputs()) {
-            std::cout << "[NPU DEBUG]   Input '" << input.get_any_name() << "': " 
-                      << input.get_partial_shape() << std::endl;
-        }
-        for (const auto& output : model->outputs()) {
-            std::cout << "[NPU DEBUG]   Output '" << output.get_any_name() << "': " 
-                      << output.get_partial_shape() << std::endl;
-        }
-        
-        std::cout << "[NPU DEBUG] Starting model compilation..." << std::endl;
+
         compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
         std::cout << "[NPU DEBUG] Model compiled successfully" << std::endl;
         // Also export compiled model if required
@@ -728,22 +767,25 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
             if (blob_path.empty()) {
                 blob_path = "openvino_model.blob";
             }
-            // Check the path is full
-            const int EXT_SIZE = 5; // ".blob"
-            if (blob_path.size() < EXT_SIZE) {
-                OPENVINO_THROW("Please provide a full path to blob file in BLOB_PATH: " + blob_path);
-            }
-            if (strncmp(".blob", &blob_path[blob_path.size() - EXT_SIZE], EXT_SIZE) != 0) {
-                OPENVINO_THROW("Please provide a full path to blob file in BLOB_PATH: " + blob_path);
-            }
-            std::ofstream fout(blob_path, std::ios::out | std::ios::binary);
-            if (!fout.is_open()) {
-                OPENVINO_THROW("Blob file can't be exported to: " + blob_path);
-            }
-            compiled.export_model(fout);
+            export_npu_model(compiled, blob_path);
         }
     }
-    return { compiled, kv_desc };
+
+    return {compiled, kv_desc};
+}
+
+std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
+                                                             const ov::AnyMap& config,
+                                                             const KVAxesPosition& kv_pos,
+                                                             const bool is_whisper) {
+    return compile_decoder_for_npu_impl(model, config, kv_pos, is_whisper ? ModelType::Whisper : ModelType::Default);
+}
+
+std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_text_embedding(const std::shared_ptr<ov::Model>& model,
+                                                                            const ov::AnyMap& config,
+                                                                            const KVAxesPosition& kv_pos,
+                                                                            const TextEmbeddingPipeline::Config& text_embed_config) {
+    return compile_decoder_for_npu_impl(model, config, kv_pos, ModelType::TextEmbedding, text_embed_config);
 }
 
 std::optional<ov::Any> pop_option(ov::AnyMap& config, const std::string& option_name) {
