@@ -151,28 +151,42 @@ void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov:
                   << ", seq_len=" << seq_len << ", vocab_size=" << vocab_size 
                   << ", prompt_len=" << prompt_len << std::endl;
         
-        // Echo mode requires full logits (disable_slice_optimization=True)
+        // Note: This echo mode path is now legacy - use optimized get_next_token_log_probs() instead
         // Check if we have enough logits positions for all prompt tokens
         if (seq_len < prompt_len) {
-            std::cout << "[UTILS ERROR] seq_len < prompt_len! This means logits were sliced despite disable_slice_optimization=True!" << std::endl;
+            std::cout << "[UTILS ERROR] seq_len < prompt_len! This means logits were sliced!" << std::endl;
             std::stringstream error_msg;
             error_msg << "Echo mode requires logits for all prompt tokens. "
                      << "Got logits shape [" << batch_size << ", " << seq_len << ", " << vocab_size << "] "
                      << "but prompt_len=" << prompt_len << ". "
-                     << "Please set disable_slice_optimization=True when creating LLMPipeline.";
+                     << "For slice optimization compatibility, use get_next_token_log_probs() instead.";
             OPENVINO_THROW(error_msg.str());
         }
 
         const float* sequence_group_logits_data = logits_data + vocab_size * currently_processed_tokens;
+
+        std::cout << "[UTILS DEBUG] Processing prompt tokens: prompt_len=" << prompt_len 
+                  << ", available seq_len=" << seq_len << std::endl;
 
         for (int offset = 0; offset < prompt_len; offset++) {
             // log_probs[i] should be log P(token_i | logits at position i-1)
             // So to compute log_prob for token at position 'offset', we use logits from position 'offset-1'
             // Special case: for offset=0 (first token), we use logits from position 0
             int logits_position = (offset == 0) ? 0 : offset - 1;
+            
+            if (logits_position >= static_cast<int>(seq_len)) {
+                std::cout << "[UTILS WARNING] Trying to access logits_position=" << logits_position 
+                          << " but seq_len=" << seq_len << " (position out of bounds!)" << std::endl;
+            }
+            
             const float* token_logits = (sequence_group_logits_data + logits_position * vocab_size);
             int64_t token_id = sequence_group->get_prompt_ids()[offset];
             float token_logit = token_logits[token_id];
+            
+            if (offset < 3 || offset >= prompt_len - 3) {
+                std::cout << "[UTILS DEBUG] Token offset=" << offset << ", logits_position=" << logits_position 
+                          << ", token_id=" << token_id << ", logit_value=" << token_logit << std::endl;
+            }
 
             // find max value for log softmax
             float max_value = -std::numeric_limits<float>::infinity();
@@ -645,10 +659,8 @@ std::pair<ov::CompiledModel, KVDesc>
 compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
                         const ov::AnyMap& config,
                         const KVAxesPosition& kv_pos,
-                        const bool is_whisper,
-                        const bool disable_slice_optimization) {
-    std::cout << "[NPU DEBUG] compile_decoder_for_npu called with disable_slice_optimization=" 
-              << (disable_slice_optimization ? "TRUE" : "FALSE") << std::endl;
+                        const bool is_whisper) {
+    std::cout << "[NPU DEBUG] compile_decoder_for_npu called (slice optimization handled by NPU plugin)" << std::endl;
     
     ov::CompiledModel compiled;
     ov::AnyMap properties = config;
@@ -695,13 +707,6 @@ compile_decoder_for_npu(const std::shared_ptr<ov::Model>& model,
             kv_desc.max_prompt_len = pop_int_and_cast(properties, "MAX_PROMPT_LEN").value_or(1024u);
             kv_desc.min_response_len = pop_int_and_cast(properties, "MIN_RESPONSE_LEN").value_or(128u);
             update_npu_config(properties, kv_pos, kv_desc);
-        }
-        // Disable logits slicing for echo mode to get log probs for all prompt tokens
-        if (disable_slice_optimization) {
-            std::cout << "[NPU DEBUG] Disabling slice optimization - setting NPUW_SLICE_OUT=NO" << std::endl;
-            update_config(properties, {"NPUW_SLICE_OUT", "NO"});
-        } else {
-            std::cout << "[NPU DEBUG] Slice optimization is ENABLED (disable_slice_optimization=false)" << std::endl;
         }
         
         // Debug: print model input/output shapes BEFORE compilation

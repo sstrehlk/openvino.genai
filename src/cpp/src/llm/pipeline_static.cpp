@@ -113,11 +113,10 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     std::cout << "[PIPELINE_STATIC DEBUG] Constructor called with echo=" 
               << (generation_config.echo ? "TRUE" : "FALSE") << std::endl;
     auto kv_pos = ov::genai::utils::get_kv_axes_pos(model);
-    // For echo mode, disable slice optimization to get logits for all prompt tokens
+    // Slice optimization is handled by NPU plugin
     auto [compiled, kv_desc] = utils::compile_decoder_for_npu(
         model, properties, kv_pos, 
-        false,  // is_whisper
-        generation_config.echo  // disable_slice_optimization
+        false  // is_whisper
     );
     m_max_prompt_len = kv_desc.max_prompt_len;
     m_kvcache_total = kv_desc.max_prompt_len + kv_desc.min_response_len;

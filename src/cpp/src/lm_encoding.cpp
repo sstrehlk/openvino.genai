@@ -166,15 +166,25 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     ov::Tensor logits;
     if (echo_enabled) {
         auto prompt_logits = m_llm.get_tensor("logits");
+        std::cout << "[LM_ENCODING DEBUG] Echo mode: Got logits tensor shape: ["
+                  << prompt_logits.get_shape()[0] << ", "
+                  << prompt_logits.get_shape()[1] << ", "
+                  << prompt_logits.get_shape()[2] << "]" << std::endl;
         ov::genai::utils::fill_prompt_log_probs(sequence_groups, prompt_logits);
         OPENVINO_ASSERT(batch_size == 1);
         size_t seq_len = prompt_logits.get_shape().at(1);
         size_t vocab_size = prompt_logits.get_shape().at(2);
+        std::cout << "[LM_ENCODING DEBUG] Extracting last token logits: seq_len=" << seq_len 
+                  << ", using position " << (seq_len - 1) << std::endl;
         const float* last_token_data = prompt_logits.data<float>() + (seq_len - 1) * vocab_size;
         logits = ov::Tensor(ov::element::f32, {batch_size, 1, vocab_size}, 
                                 const_cast<float*>(last_token_data));
     } else {
         logits = m_llm.get_tensor("logits");
+        std::cout << "[LM_ENCODING DEBUG] Non-echo mode: Got logits tensor shape: ["
+                  << logits.get_shape()[0] << ", "
+                  << logits.get_shape()[1] << ", "
+                  << logits.get_shape()[2] << "]" << std::endl;
     }
 
     int64_t output_sequence_len = logits.get_shape().at(1);
