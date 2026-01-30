@@ -79,11 +79,8 @@ void update_npu_config(ov::AnyMap& config,
     update_config(config, {"NPU_USE_NPUW", "YES"});
     update_config(config, {"NPUW_LLM", "YES"});
 
-    // For NPU: model inputs are 2D [batch, seq_len], so seq_len_dim = 1
-    // kv_pos.seq_len is for 4D KV cache [batch, num_heads, seq_len, head_dim]
-    // but NPUW needs dimension index for 2D input tensors
     update_config(config, {"NPUW_LLM_BATCH_DIM", kv_pos.batch});
-    update_config(config, {"NPUW_LLM_SEQ_LEN_DIM", 1});  // Always 1 for 2D inputs [batch=0, seq_len=1]
+    update_config(config, {"NPUW_LLM_SEQ_LEN_DIM", kv_pos.seq_len});
 
     update_config(config, {"NPUW_LLM_MAX_PROMPT_LEN", kv_desc.max_prompt_len});
     update_config(config, {"NPUW_LLM_MIN_RESPONSE_LEN", kv_desc.min_response_len});
@@ -764,6 +761,30 @@ std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_impl(const std::sha
     } else {
         std::cout << "[NPU DEBUG] Compiling model from scratch..." << std::endl;
         
+        // Log KV cache parameters BEFORE compilation
+        std::cout << "[NPU DEBUG] ========== KV CACHE INSPECTION (BEFORE) ==========" << std::endl;
+        for (const auto& param : model->get_parameters()) {
+            const auto& name = param->get_friendly_name();
+            if (name.find("past_key_values") != std::string::npos) {
+                std::cout << "[NPU DEBUG] KV Parameter: " << name << std::endl;
+                std::cout << "[NPU DEBUG]   - shape: " << param->get_partial_shape() << std::endl;
+                std::cout << "[NPU DEBUG]   - element_type: " << param->get_element_type() << std::endl;
+            }
+        }
+        
+        for (const auto& op : model->get_ops()) {
+            if (op->get_type_name() == std::string("ReadValue")) {
+                std::cout << "[NPU DEBUG] ReadValue (KV cache state): " << op->get_friendly_name() << std::endl;
+                if (op->get_input_size() > 0) {
+                    std::cout << "[NPU DEBUG]   - input shape: " << op->get_input_partial_shape(0) << std::endl;
+                }
+                if (op->get_output_size() > 0) {
+                    std::cout << "[NPU DEBUG]   - output shape: " << op->get_output_partial_shape(0) << std::endl;
+                }
+            }
+        }
+        std::cout << "[NPU DEBUG] ===================================================" << std::endl;
+        
         switch (model_type) {
         case ModelType::TextEmbedding:
             std::cout << "[NPU DEBUG] Configuring for TextEmbedding model" << std::endl;
@@ -813,6 +834,24 @@ std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_impl(const std::sha
         try {
             compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
             std::cout << "[NPU DEBUG] ✓ NPU compilation SUCCESSFUL!" << std::endl;
+            
+            // Log compiled model inputs/outputs to see what happened to KV cache
+            std::cout << "[NPU DEBUG] ========== COMPILED MODEL INSPECTION ==========" << std::endl;
+            std::cout << "[NPU DEBUG] Compiled model inputs:" << std::endl;
+            for (const auto& input : compiled.inputs()) {
+                const auto& name = input.get_any_name();
+                std::cout << "[NPU DEBUG]   - " << name << ": " << input.get_partial_shape() 
+                          << " (" << input.get_element_type() << ")" << std::endl;
+            }
+            
+            std::cout << "[NPU DEBUG] Compiled model outputs:" << std::endl;
+            for (const auto& output : compiled.outputs()) {
+                const auto& name = output.get_any_name();
+                std::cout << "[NPU DEBUG]   - " << name << ": " << output.get_partial_shape()
+                          << " (" << output.get_element_type() << ")" << std::endl;
+            }
+            std::cout << "[NPU DEBUG] ===================================================" << std::endl;
+            
         } catch (const std::exception& e) {
             std::cout << "[NPU DEBUG] ✗ NPU compilation FAILED!" << std::endl;
             std::cout << "[NPU DEBUG] Exception: " << e.what() << std::endl;
