@@ -79,8 +79,11 @@ void update_npu_config(ov::AnyMap& config,
     update_config(config, {"NPU_USE_NPUW", "YES"});
     update_config(config, {"NPUW_LLM", "YES"});
 
+    // For NPU: model inputs are 2D [batch, seq_len], so seq_len_dim = 1
+    // kv_pos.seq_len is for 4D KV cache [batch, num_heads, seq_len, head_dim]
+    // but NPUW needs dimension index for 2D input tensors
     update_config(config, {"NPUW_LLM_BATCH_DIM", kv_pos.batch});
-    update_config(config, {"NPUW_LLM_SEQ_LEN_DIM", kv_pos.seq_len});
+    update_config(config, {"NPUW_LLM_SEQ_LEN_DIM", 1});  // Always 1 for 2D inputs [batch=0, seq_len=1]
 
     update_config(config, {"NPUW_LLM_MAX_PROMPT_LEN", kv_desc.max_prompt_len});
     update_config(config, {"NPUW_LLM_MIN_RESPONSE_LEN", kv_desc.min_response_len});
