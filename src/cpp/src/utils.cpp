@@ -736,6 +736,11 @@ std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_impl(const std::sha
                                                                   const KVAxesPosition& kv_pos,
                                                                   ModelType model_type,
                                                                   const TextEmbeddingPipeline::Config& text_embed_config = {}) {
+    std::cout << "\n[NPU DEBUG] ===== compile_decoder_for_npu_impl() ENTRY =====" << std::endl;
+    std::cout << "[NPU DEBUG] Model name: " << model->get_friendly_name() << std::endl;
+    std::cout << "[NPU DEBUG] KV axes: batch=" << kv_pos.batch << ", seq_len=" << kv_pos.seq_len << std::endl;
+    std::cout << "[NPU DEBUG] Model type: " << static_cast<int>(model_type) << std::endl;
+    
     ov::CompiledModel compiled;
     ov::AnyMap properties = config;
     KVDesc kv_desc;
@@ -744,33 +749,84 @@ std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_impl(const std::sha
     const auto export_blob = pop_or_default(properties, "EXPORT_BLOB", false);
     const bool do_import = (!blob_path.empty() && !export_blob);
 
+    std::cout << "[NPU DEBUG] Blob handling:" << std::endl;
+    std::cout << "[NPU DEBUG]   - blob_path: '" << blob_path << "'" << std::endl;
+    std::cout << "[NPU DEBUG]   - export_blob: " << export_blob << std::endl;
+    std::cout << "[NPU DEBUG]   - do_import: " << do_import << std::endl;
+
     if (do_import) {
+        std::cout << "[NPU DEBUG] Importing pre-compiled blob from: " << blob_path << std::endl;
         import_npu_model(compiled, kv_desc, properties, blob_path);
+        std::cout << "[NPU DEBUG] Import completed successfully" << std::endl;
     } else {
+        std::cout << "[NPU DEBUG] Compiling model from scratch..." << std::endl;
+        
         switch (model_type) {
         case ModelType::TextEmbedding:
+            std::cout << "[NPU DEBUG] Configuring for TextEmbedding model" << std::endl;
             get_npu_text_embedding_config(properties, kv_pos, kv_desc, text_embed_config);
             break;
         case ModelType::Whisper:
+            std::cout << "[NPU DEBUG] Configuring for Whisper model" << std::endl;
             get_npu_model_config(properties, kv_pos, kv_desc, true);
             break;
         case ModelType::Default:
         default:
+            std::cout << "[NPU DEBUG] Configuring for Default (LLM) model" << std::endl;
             get_npu_model_config(properties, kv_pos, kv_desc, false);
             break;
         }
 
-        compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
-        std::cout << "[NPU DEBUG] Model compiled successfully" << std::endl;
+        std::cout << "[NPU DEBUG] KV cache configuration:" << std::endl;
+        std::cout << "[NPU DEBUG]   - max_prompt_len: " << kv_desc.max_prompt_len << std::endl;
+        std::cout << "[NPU DEBUG]   - min_response_len: " << kv_desc.min_response_len << std::endl;
+        
+        std::cout << "[NPU DEBUG] Final NPU properties:" << std::endl;
+        for (const auto& prop : properties) {
+            std::cout << "[NPU DEBUG]   - " << prop.first << " = ";
+            try {
+                std::cout << prop.second.as<std::string>();
+            } catch (...) {
+                std::cout << "<complex value>";
+            }
+            std::cout << std::endl;
+        }
+        
+        // Optional: Serialize model XML for debugging
+        if (const char* save_xml = std::getenv("NPU_DEBUG_SAVE_XML")) {
+            std::string xml_path = std::string(save_xml) + "_before_npu_compile.xml";
+            std::cout << "[NPU DEBUG] Saving model XML for debugging: " << xml_path << std::endl;
+            try {
+                ov::serialize(model, xml_path);
+                std::cout << "[NPU DEBUG] Model XML saved successfully" << std::endl;
+            } catch (const std::exception& e) {
+                std::cout << "[NPU DEBUG] WARNING: Failed to save XML: " << e.what() << std::endl;
+            }
+        }
+        
+        std::cout << "[NPU DEBUG] Calling Core::compile_model(model, 'NPU', properties)..." << std::endl;
+        std::cout << "[NPU DEBUG] **** THIS IS WHERE NPU COMPILATION HAPPENS ****" << std::endl;
+        
+        try {
+            compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
+            std::cout << "[NPU DEBUG] ✓ NPU compilation SUCCESSFUL!" << std::endl;
+        } catch (const std::exception& e) {
+            std::cout << "[NPU DEBUG] ✗ NPU compilation FAILED!" << std::endl;
+            std::cout << "[NPU DEBUG] Exception: " << e.what() << std::endl;
+            throw;
+        }
+        
         // Also export compiled model if required
         if (export_blob) {
             if (blob_path.empty()) {
                 blob_path = "openvino_model.blob";
             }
+            std::cout << "[NPU DEBUG] Exporting compiled blob to: " << blob_path << std::endl;
             export_npu_model(compiled, blob_path);
         }
     }
 
+    std::cout << "[NPU DEBUG] ===== compile_decoder_for_npu_impl() EXIT =====" << std::endl;
     return {compiled, kv_desc};
 }
 

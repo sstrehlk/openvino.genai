@@ -55,27 +55,70 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     const ov::AnyMap& properties,
     const ov::genai::GenerationConfig& generation_config)
     : LLMPipelineImplBase(tokenizer, generation_config), m_sampler(m_tokenizer) {
-    std::cout << "[PIPELINE DEBUG] StatefulLLMPipeline constructor called with device='" << device << "'" << std::endl;
+    std::cout << "[PIPELINE DEBUG] ========================================" << std::endl;
+    std::cout << "[PIPELINE DEBUG] StatefulLLMPipeline constructor called" << std::endl;
+    std::cout << "[PIPELINE DEBUG]   - device='" << device << "'" << std::endl;
     
     if (device.find("NPU") != std::string::npos) {
         m_is_npu = true;
         m_use_full_chat_history = true;
-        std::cout << "[PIPELINE DEBUG] NPU detected in device name, m_is_npu=true" << std::endl;
+        std::cout << "[NPU DEBUG] *** NPU DEVICE DETECTED ***" << std::endl;
+        std::cout << "[NPU DEBUG]   - m_is_npu=true" << std::endl;
+        std::cout << "[NPU DEBUG]   - m_use_full_chat_history=true" << std::endl;
     } else {
-        std::cout << "[PIPELINE DEBUG] NPU not detected in device name, m_is_npu=false" << std::endl;
+        std::cout << "[PIPELINE DEBUG] Non-NPU device, m_is_npu=false" << std::endl;
     }
+    std::cout << "[PIPELINE DEBUG] ========================================" << std::endl;
 
     // Slice optimization is always enabled (except on NPU where plugin handles it)
     // Our optimized get_next_token_log_probs() works correctly with slice optimization
-    std::cout << "[PIPELINE DEBUG] Slice optimization decision: m_is_npu=" << m_is_npu << std::endl;
+    std::cout << "\n[NPU DEBUG] ========== SLICE OPTIMIZATION DECISION ==========" << std::endl;
+    std::cout << "[NPU DEBUG] m_is_npu=" << m_is_npu << std::endl;
     if (!m_is_npu) {
         m_slice_optimization_enabled = true;
-        std::cout << "[PIPELINE DEBUG] ✓ APPLYING slice_before_matmul transformation" << std::endl;
+        std::cout << "[SLICE OPT] ✓ APPLYING slice_before_matmul transformation" << std::endl;
         utils::apply_slice_before_matmul_transformation(model);
     } else {
         m_slice_optimization_enabled = false;
-        std::cout << "[PIPELINE DEBUG] ✗ SKIPPING slice_before_matmul (NPU handles it internally)" << std::endl;
+        std::cout << "[NPU DEBUG] ✗ SKIPPING slice_before_matmul (NPU handles it internally)" << std::endl;
+        
+        // Log model structure for NPU debugging
+        std::cout << "[NPU DEBUG] Model info BEFORE NPU compilation:" << std::endl;
+        std::cout << "[NPU DEBUG]   - Model name: " << model->get_friendly_name() << std::endl;
+        std::cout << "[NPU DEBUG]   - Number of operations: " << model->get_ops().size() << std::endl;
+        
+        // Log input shapes
+        std::cout << "[NPU DEBUG]   - Model inputs:" << std::endl;
+        for (const auto& input : model->inputs()) {
+            std::cout << "[NPU DEBUG]     * " << input.get_any_name() << ": ";
+            std::cout << "shape=" << input.get_partial_shape() << ", type=" << input.get_element_type() << std::endl;
+        }
+        
+        // Log output shapes  
+        std::cout << "[NPU DEBUG]   - Model outputs:" << std::endl;
+        for (const auto& output : model->outputs()) {
+            std::cout << "[NPU DEBUG]     * " << output.get_any_name() << ": ";
+            std::cout << "shape=" << output.get_partial_shape() << ", type=" << output.get_element_type() << std::endl;
+        }
+        
+        // Look for MatMul operations that might cause issues
+        std::cout << "[NPU DEBUG]   - First 5 MatMul operations:" << std::endl;
+        int matmul_count = 0;
+        for (const auto& op : model->get_ops()) {
+            if (matmul_count >= 5) break;
+            if (op->get_type_info().name == std::string("MatMul")) {
+                matmul_count++;
+                std::cout << "[NPU DEBUG]     MatMul #" << matmul_count << ": " << op->get_friendly_name() << std::endl;
+                for (size_t i = 0; i < op->get_input_size(); ++i) {
+                    std::cout << "[NPU DEBUG]       - input[" << i << "]: " << op->get_input_partial_shape(i) << std::endl;
+                }
+                for (size_t i = 0; i < op->get_output_size(); ++i) {
+                    std::cout << "[NPU DEBUG]       - output[" << i << "]: " << op->get_output_partial_shape(i) << std::endl;
+                }
+            }
+        }
     }
+    std::cout << "[NPU DEBUG] ==================================================\n" << std::endl;
 
     auto kv_pos = ov::genai::utils::get_kv_axes_pos(model);
 
@@ -90,10 +133,21 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     }
     ov::CompiledModel compiled_model;
     if (m_is_npu) {
+        std::cout << "\n[NPU DEBUG] ========== NPU MODEL COMPILATION ==========" << std::endl;
+        std::cout << "[NPU DEBUG] About to call compile_decoder_for_npu()..." << std::endl;
+        std::cout << "[NPU DEBUG]   - device: NPU" << std::endl;
+        std::cout << "[NPU DEBUG]   - KV axes position: batch=" << kv_pos.batch << ", seq_len=" << kv_pos.seq_len << std::endl;
+        
         utils::KVDesc kv_desc;
         std::tie(compiled_model, kv_desc) = utils::compile_decoder_for_npu(model, *filtered_properties, kv_pos, false);
+        
         m_max_prompt_len = kv_desc.max_prompt_len;
         m_max_kv_cache_size = kv_desc.max_prompt_len + kv_desc.min_response_len;
+        
+        std::cout << "[NPU DEBUG] NPU compilation completed successfully!" << std::endl;
+        std::cout << "[NPU DEBUG]   - max_prompt_len: " << m_max_prompt_len << std::endl;
+        std::cout << "[NPU DEBUG]   - max_kv_cache_size: " << m_max_kv_cache_size << std::endl;
+        std::cout << "[NPU DEBUG] ===============================================\n" << std::endl;
     } else {
        compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
     }
