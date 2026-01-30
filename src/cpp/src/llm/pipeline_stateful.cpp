@@ -4,8 +4,14 @@
 
 #include "llm/pipeline_stateful.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <iostream>
+
 #include "lora/helper.hpp"
 #include "lm_encoding.hpp"
+#include "openvino/genai/llm_pipeline.hpp"
 #include "openvino/genai/text_streamer.hpp"
 
 #include "utils.hpp"
@@ -49,16 +55,65 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     const ov::AnyMap& properties,
     const ov::genai::GenerationConfig& generation_config)
     : LLMPipelineImplBase(tokenizer, generation_config), m_sampler(m_tokenizer) {
+    std::cout << "[PIPELINE DEBUG] ========================================" << std::endl;
+    std::cout << "[PIPELINE DEBUG] StatefulLLMPipeline constructor called" << std::endl;
+    std::cout << "[PIPELINE DEBUG]   - device='" << device << "'" << std::endl;
+    
     if (device.find("NPU") != std::string::npos) {
         m_is_npu = true;
         m_use_full_chat_history = true;
+        std::cout << "[NPU DEBUG] *** NPU DEVICE DETECTED ***" << std::endl;
+        std::cout << "[NPU DEBUG]   - m_is_npu=true" << std::endl;
+        std::cout << "[NPU DEBUG]   - m_use_full_chat_history=true" << std::endl;
+    } else {
+        std::cout << "[PIPELINE DEBUG] Non-NPU device, m_is_npu=false" << std::endl;
     }
+    std::cout << "[PIPELINE DEBUG] ========================================" << std::endl;
 
-    // FIXME: slicing produces incorrect results for some models on NPU.
-    // On NPU, applying slice the safe way is done by the underlying plugin
+    // Slice optimization is always enabled (except on NPU where plugin handles it)
+    // Our optimized get_next_token_log_probs() works correctly with slice optimization
+    std::cout << "\n[NPU DEBUG] ========== SLICE OPTIMIZATION DECISION ==========" << std::endl;
+    std::cout << "[NPU DEBUG] m_is_npu=" << m_is_npu << std::endl;
     if (!m_is_npu) {
         utils::apply_slice_before_matmul_transformation(model);
+    } else {
+        // Log model structure for NPU debugging
+        std::cout << "[NPU DEBUG] Model info BEFORE NPU compilation:" << std::endl;
+        std::cout << "[NPU DEBUG]   - Model name: " << model->get_friendly_name() << std::endl;
+        std::cout << "[NPU DEBUG]   - Number of operations: " << model->get_ops().size() << std::endl;
+        
+        // Log input shapes
+        std::cout << "[NPU DEBUG]   - Model inputs:" << std::endl;
+        for (const auto& input : model->inputs()) {
+            std::cout << "[NPU DEBUG]     * " << input.get_any_name() << ": ";
+            std::cout << "shape=" << input.get_partial_shape() << ", type=" << input.get_element_type() << std::endl;
+        }
+        
+        // Log output shapes  
+        std::cout << "[NPU DEBUG]   - Model outputs:" << std::endl;
+        for (const auto& output : model->outputs()) {
+            std::cout << "[NPU DEBUG]     * " << output.get_any_name() << ": ";
+            std::cout << "shape=" << output.get_partial_shape() << ", type=" << output.get_element_type() << std::endl;
+        }
+        
+        // Look for MatMul operations that might cause issues
+        std::cout << "[NPU DEBUG]   - First 5 MatMul operations:" << std::endl;
+        int matmul_count = 0;
+        for (const auto& op : model->get_ops()) {
+            if (matmul_count >= 5) break;
+            if (op->get_type_info().name == std::string("MatMul")) {
+                matmul_count++;
+                std::cout << "[NPU DEBUG]     MatMul #" << matmul_count << ": " << op->get_friendly_name() << std::endl;
+                for (size_t i = 0; i < op->get_input_size(); ++i) {
+                    std::cout << "[NPU DEBUG]       - input[" << i << "]: " << op->get_input_partial_shape(i) << std::endl;
+                }
+                for (size_t i = 0; i < op->get_output_size(); ++i) {
+                    std::cout << "[NPU DEBUG]       - output[" << i << "]: " << op->get_output_partial_shape(i) << std::endl;
+                }
+            }
+        }
     }
+    std::cout << "[NPU DEBUG] ==================================================\n" << std::endl;
 
     auto kv_pos = ov::genai::utils::get_kv_axes_pos(model);
 
@@ -73,10 +128,21 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     }
     ov::CompiledModel compiled_model;
     if (m_is_npu) {
+        std::cout << "\n[NPU DEBUG] ========== NPU MODEL COMPILATION ==========" << std::endl;
+        std::cout << "[NPU DEBUG] About to call compile_decoder_for_npu()..." << std::endl;
+        std::cout << "[NPU DEBUG]   - device: NPU" << std::endl;
+        std::cout << "[NPU DEBUG]   - KV axes position: batch=" << kv_pos.batch << ", seq_len=" << kv_pos.seq_len << std::endl;
+        
         utils::KVDesc kv_desc;
-        std::tie(compiled_model, kv_desc) = utils::compile_decoder_for_npu(model, *filtered_properties, kv_pos);
+        std::tie(compiled_model, kv_desc) = utils::compile_decoder_for_npu(model, *filtered_properties, kv_pos, false);
+        
         m_max_prompt_len = kv_desc.max_prompt_len;
         m_max_kv_cache_size = kv_desc.max_prompt_len + kv_desc.min_response_len;
+        
+        std::cout << "[NPU DEBUG] NPU compilation completed successfully!" << std::endl;
+        std::cout << "[NPU DEBUG]   - max_prompt_len: " << m_max_prompt_len << std::endl;
+        std::cout << "[NPU DEBUG]   - max_kv_cache_size: " << m_max_kv_cache_size << std::endl;
+        std::cout << "[NPU DEBUG] ===============================================\n" << std::endl;
     } else {
        compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
     }
@@ -345,8 +411,8 @@ EncodedResults StatefulLLMPipeline::generate(
             "Currently only \"num_return_sequences\" equal to 1 is supported for NPU device!");
     }
 
-    // Stateful pipeline does not provide logprobs for prompt tokens
-    OPENVINO_ASSERT(config.echo == false, "Echo is not supported in the stateful pipeline");
+    // echo could be supported if not enable SLICE_OUT
+    // OPENVINO_ASSERT(config.echo == false, "Echo is not supported in the stateful pipeline");
 
     std::shared_ptr<StreamerBase> streamer_ptr = ov::genai::utils::create_streamer(streamer, m_tokenizer);
 
@@ -495,6 +561,202 @@ void StatefulLLMPipeline::finish_chat() {
         m_tokenized_chat_history.clear();
         m_kv_cache_state.reset_state();
     }
+}
+
+std::vector<float> StatefulLLMPipeline::get_next_token_log_probs(
+    const std::string& prompt,
+    const std::vector<int64_t>& token_ids
+) {
+    std::cout << "[GET_NEXT_TOKEN DEBUG] Called with prompt length=" << prompt.length() 
+              << ", " << token_ids.size() << " continuation tokens" << std::endl;
+    std::cout << "[GET_NEXT_TOKEN DEBUG] m_is_npu=" << m_is_npu 
+              << ", m_slice_optimization_enabled=" << m_slice_optimization_enabled << std::endl;
+    
+    // If slice optimization is enabled, run single inference and extract all log_probs
+
+    std::cout << "[SLICE_OPT DEBUG] ========== SLICE OPTIMIZATION MODE ENABLED ==========" << std::endl;
+    std::cout << "[SLICE_OPT DEBUG] OPTIMIZED: Single inference for all tokens" << std::endl;
+    
+    // Tokenize the prompt (context only, without any continuation)
+    std::cout << "[SLICE_OPT DEBUG] Original prompt: \"" << prompt << "\"" << std::endl;
+    ov::Tensor prompt_ids = m_tokenizer.encode(prompt).input_ids;
+    size_t prompt_len = prompt_ids.get_shape().at(1);
+    size_t batch_size = prompt_ids.get_shape().at(0);
+    
+    std::cout << "[SLICE_OPT DEBUG] Tokenized prompt:" << std::endl;
+    std::cout << "[SLICE_OPT DEBUG]   - batch_size: " << batch_size << std::endl;
+    std::cout << "[SLICE_OPT DEBUG]   - prompt_len: " << prompt_len << std::endl;
+    std::cout << "[SLICE_OPT DEBUG]   - prompt_ids shape: [" << prompt_ids.get_shape()[0] 
+                << ", " << prompt_ids.get_shape()[1] << "]" << std::endl;
+    
+    // Print first 10 and last 5 tokens
+    const int64_t* prompt_data = prompt_ids.data<const int64_t>();
+    std::cout << "[SLICE_OPT DEBUG]   - First tokens: [";
+    for (size_t i = 0; i < std::min((size_t)10, prompt_len); ++i) {
+        std::cout << prompt_data[i];
+        if (i < std::min((size_t)10, prompt_len) - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+    if (prompt_len > 10) {
+        std::cout << "[SLICE_OPT DEBUG]   - Last tokens: [";
+        for (size_t i = std::max((size_t)0, prompt_len - 5); i < prompt_len; ++i) {
+            std::cout << prompt_data[i];
+            if (i < prompt_len - 1) std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
+    }
+    
+    std::cout << "[SLICE_OPT DEBUG] Number of continuation tokens to evaluate: " << token_ids.size() << std::endl;
+    std::cout << "[SLICE_OPT DEBUG] Continuation token IDs: [";
+    for (size_t i = 0; i < token_ids.size(); ++i) {
+        std::cout << token_ids[i];
+        if (i < token_ids.size() - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+    
+    // ========== SINGLE INFERENCE FOR ALL TOKENS ==========
+    std::cout << "\n[SLICE_OPT DEBUG] ===== RUNNING SINGLE INFERENCE =====" << std::endl;
+    
+    // Reset KV cache
+    std::cout << "[SLICE_OPT DEBUG] Step 1: Resetting KV cache state..." << std::endl;
+    reset_kv_state();
+    
+    // Set inputs
+    std::cout << "[SLICE_OPT DEBUG] Step 2: Setting input tensors..." << std::endl;
+    std::cout << "[SLICE_OPT DEBUG]   - Setting input_ids: shape=[" << prompt_ids.get_shape()[0] 
+                << ", " << prompt_ids.get_shape()[1] << "], size=" << prompt_ids.get_size() << std::endl;
+    m_model_runner.set_tensor("input_ids", prompt_ids);
+    
+    // Set attention mask (all 1s for full prompt)
+    ov::Tensor attention_mask = ov::Tensor{ov::element::i64, prompt_ids.get_shape()};
+    std::fill_n(attention_mask.data<int64_t>(), attention_mask.get_size(), 1);
+    std::cout << "[SLICE_OPT DEBUG]   - Setting attention_mask: shape=[" << attention_mask.get_shape()[0] 
+                << ", " << attention_mask.get_shape()[1] << "], all values=1" << std::endl;
+    m_model_runner.set_tensor("attention_mask", attention_mask);
+    
+    // Initialize position_ids if needed
+    try {
+        size_t num_inputs = m_model_runner.get_compiled_model().inputs().size();
+        std::cout << "[SLICE_OPT DEBUG]   - Model has " << num_inputs << " inputs" << std::endl;
+        if (num_inputs == 4) {
+            ov::Tensor position_ids = ov::Tensor{ov::element::i64, prompt_ids.get_shape()};
+            utils::initialize_position_ids(position_ids, attention_mask, 0);
+            std::cout << "[SLICE_OPT DEBUG]   - Setting position_ids: shape=[" << position_ids.get_shape()[0] 
+                        << ", " << position_ids.get_shape()[1] << "]" << std::endl;
+            const int64_t* pos_data = position_ids.data<const int64_t>();
+            std::cout << "[SLICE_OPT DEBUG]   - Position IDs first 5: [";
+            for (size_t k = 0; k < std::min((size_t)5, position_ids.get_size()); ++k) {
+                std::cout << pos_data[k];
+                if (k < std::min((size_t)5, position_ids.get_size()) - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
+            m_model_runner.set_tensor("position_ids", position_ids);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[SLICE_OPT DEBUG] ERROR: Could not initialize position_ids: " << e.what() << std::endl;
+    }
+    
+    // Set beam_idx
+    ov::Tensor beam_idx = ov::Tensor{ov::element::i32, {batch_size}};
+    std::fill_n(beam_idx.data<int32_t>(), batch_size, 0);
+    std::cout << "[SLICE_OPT DEBUG]   - Setting beam_idx: shape=[" << beam_idx.get_shape()[0] 
+                << "], value=0" << std::endl;
+    m_model_runner.set_tensor("beam_idx", beam_idx);
+    
+    // Run inference ONCE
+    std::cout << "[SLICE_OPT DEBUG] Step 3: Running inference (m_model_runner.infer()) - ONCE for all tokens..." << std::endl;
+    auto inference_start = std::chrono::high_resolution_clock::now();
+    m_model_runner.infer();
+    auto inference_end = std::chrono::high_resolution_clock::now();
+    auto inference_duration = std::chrono::duration_cast<std::chrono::milliseconds>(inference_end - inference_start);
+    std::cout << "[SLICE_OPT DEBUG] Step 3: Inference completed in " << inference_duration.count() << " ms!" << std::endl;
+    
+    // Get logits - with slice optimization, we only get last position
+    std::cout << "[SLICE_OPT DEBUG] Step 4: Retrieving logits tensor..." << std::endl;
+    ov::Tensor logits_tensor = m_model_runner.get_tensor("logits");
+    auto logits_shape = logits_tensor.get_shape();
+    const float* logits_data = logits_tensor.data<const float>();
+    size_t vocab_size = logits_shape.back();
+    size_t logits_seq_len = logits_shape[1];
+    
+    std::cout << "[SLICE_OPT DEBUG]   - Logits tensor shape: [";
+    for (size_t d = 0; d < logits_shape.size(); ++d) {
+        std::cout << logits_shape[d];
+        if (d < logits_shape.size() - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+    std::cout << "[SLICE_OPT DEBUG]   - vocab_size: " << vocab_size << std::endl;
+    std::cout << "[SLICE_OPT DEBUG]   - logits_seq_len: " << logits_seq_len << std::endl;
+    std::cout << "[SLICE_OPT DEBUG]   - Total logits elements: " << logits_tensor.get_size() << std::endl;
+    
+    // Use the LAST position's logits (predicts what comes after prompt)
+    size_t logits_pos = logits_seq_len - 1;
+    std::cout << "[SLICE_OPT DEBUG]   - Using logits at position: " << logits_pos << " (last position)" << std::endl;
+    const float* position_logits = logits_data + logits_pos * vocab_size;
+    
+    // Show some sample logits values
+    std::cout << "[SLICE_OPT DEBUG]   - Sample logits at position " << logits_pos << ":" << std::endl;
+    std::cout << "[SLICE_OPT DEBUG]     - logits[0]: " << position_logits[0] << std::endl;
+    std::cout << "[SLICE_OPT DEBUG]     - logits[100]: " << position_logits[100] << std::endl;
+    std::cout << "[SLICE_OPT DEBUG]     - logits[1000]: " << position_logits[1000] << std::endl;
+    
+    // Compute log softmax normalization ONCE for all tokens
+    std::cout << "[SLICE_OPT DEBUG] Step 5: Computing log softmax normalization (ONCE for all tokens)..." << std::endl;
+    float max_val = -std::numeric_limits<float>::infinity();
+    for (size_t j = 0; j < vocab_size; ++j) {
+        if (position_logits[j] > max_val) {
+            max_val = position_logits[j];
+        }
+    }
+    std::cout << "[SLICE_OPT DEBUG]   - max_val across vocabulary: " << max_val << std::endl;
+    
+    double log_sum = 0.0;
+    for (size_t j = 0; j < vocab_size; ++j) {
+        log_sum += std::exp(position_logits[j] - max_val);
+    }
+    log_sum = std::log(log_sum);
+    std::cout << "[SLICE_OPT DEBUG]   - log_sum (log of sum of exp): " << log_sum << std::endl;
+    
+    // Extract log_probs for each continuation token from the same logits
+    std::cout << "\n[SLICE_OPT DEBUG] Step 6: Extracting log_probs for " << token_ids.size() 
+                << " continuation tokens..." << std::endl;
+    
+    std::vector<float> result;
+    result.reserve(token_ids.size());
+    
+    for (size_t i = 0; i < token_ids.size(); ++i) {
+        int64_t cont_token = token_ids[i];
+        
+        std::cout << "[SLICE_OPT DEBUG]   Processing token " << i << "/" << token_ids.size() 
+                    << " (ID=" << cont_token << ")..." << std::endl;
+        
+        if (cont_token >= (int64_t)vocab_size || cont_token < 0) {
+            std::cerr << "[SLICE_OPT DEBUG]   ERROR: token " << cont_token 
+                        << " is out of vocabulary range [0, " << vocab_size << ")" << std::endl;
+            result.push_back(-1000.0f);
+            continue;
+        }
+        
+        float raw_logit = position_logits[cont_token];
+        float log_prob = raw_logit - max_val - static_cast<float>(log_sum);
+        
+        std::cout << "[SLICE_OPT DEBUG]     - raw_logit: " << raw_logit << std::endl;
+        std::cout << "[SLICE_OPT DEBUG]     - log_prob = " << raw_logit 
+                    << " - " << max_val << " - " << log_sum << " = " << log_prob << std::endl;
+        
+        result.push_back(log_prob);
+    }
+    
+    std::cout << "\n[SLICE_OPT DEBUG] ========== ALL TOKENS PROCESSED ==========" << std::endl;
+    std::cout << "[SLICE_OPT DEBUG] Final results (" << result.size() << " tokens):" << std::endl;
+    for (size_t i = 0; i < result.size(); ++i) {
+        std::cout << "[SLICE_OPT DEBUG]   Token " << i << " (ID=" << token_ids[i] 
+                    << "): log_prob=" << result[i] << std::endl;
+    }
+    std::cout << "[SLICE_OPT DEBUG] OPTIMIZATION: Saved " << (token_ids.size() - 1) 
+                << " redundant inference(s)!" << std::endl;
+    
+    return result;
 }
 
 StatefulLLMPipeline::~StatefulLLMPipeline() {

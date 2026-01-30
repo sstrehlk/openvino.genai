@@ -145,6 +145,91 @@ namespace ov {
 namespace genai {
 namespace utils {
 
+void fill_prompt_log_probs(std::vector<SequenceGroup::Ptr>& sequence_groups, ov::Tensor& logits) {
+    const float * logits_data = logits.data<float>();
+    ov::Shape logits_shape = logits.get_shape();
+    OPENVINO_ASSERT(logits_shape.size() == 3);
+    size_t batch_size = logits_shape[0];
+    size_t seq_len = logits_shape[1];
+    size_t vocab_size = logits_shape[2];
+    
+    for (size_t sequence_group_id = 0, currently_processed_tokens = 0; sequence_group_id < sequence_groups.size(); ++sequence_group_id) {
+        SequenceGroup::Ptr sequence_group = sequence_groups[sequence_group_id];
+        if (!sequence_group->get_sampling_parameters().echo)
+            continue;
+
+        size_t num_running_sequences = sequence_group->num_running_seqs();
+        OPENVINO_ASSERT(num_running_sequences == 1);
+        size_t prompt_len = sequence_group->get_prompt_len();
+        
+        std::cout << "[UTILS DEBUG] Echo mode processing: batch_size=" << batch_size 
+                  << ", seq_len=" << seq_len << ", vocab_size=" << vocab_size 
+                  << ", prompt_len=" << prompt_len << std::endl;
+        
+        // Note: This echo mode path is now legacy - use optimized get_next_token_log_probs() instead
+        // Check if we have enough logits positions for all prompt tokens
+        if (seq_len < prompt_len) {
+            std::cout << "[UTILS ERROR] seq_len < prompt_len! This means logits were sliced!" << std::endl;
+            std::stringstream error_msg;
+            error_msg << "Echo mode requires logits for all prompt tokens. "
+                     << "Got logits shape [" << batch_size << ", " << seq_len << ", " << vocab_size << "] "
+                     << "but prompt_len=" << prompt_len << ". "
+                     << "For slice optimization compatibility, use get_next_token_log_probs() instead.";
+            OPENVINO_THROW(error_msg.str());
+        }
+
+        const float* sequence_group_logits_data = logits_data + vocab_size * currently_processed_tokens;
+
+        std::cout << "[UTILS DEBUG] Processing prompt tokens: prompt_len=" << prompt_len 
+                  << ", available seq_len=" << seq_len << std::endl;
+
+        for (int offset = 0; offset < prompt_len; offset++) {
+            // log_probs[i] should be log P(token_i | logits at position i-1)
+            // So to compute log_prob for token at position 'offset', we use logits from position 'offset-1'
+            // Special case: for offset=0 (first token), we use logits from position 0
+            int logits_position = (offset == 0) ? 0 : offset - 1;
+            
+            if (logits_position >= static_cast<int>(seq_len)) {
+                std::cout << "[UTILS WARNING] Trying to access logits_position=" << logits_position 
+                          << " but seq_len=" << seq_len << " (position out of bounds!)" << std::endl;
+            }
+            
+            const float* token_logits = (sequence_group_logits_data + logits_position * vocab_size);
+            int64_t token_id = sequence_group->get_prompt_ids()[offset];
+            float token_logit = token_logits[token_id];
+            
+            if (offset < 3 || offset >= prompt_len - 3) {
+                std::cout << "[UTILS DEBUG] Token offset=" << offset << ", logits_position=" << logits_position 
+                          << ", token_id=" << token_id << ", logit_value=" << token_logit << std::endl;
+            }
+
+            // find max value for log softmax
+            float max_value = -std::numeric_limits<float>::infinity();
+            size_t max_index = 0;
+            for (size_t i = 0; i < vocab_size; ++i) {
+                if (token_logits[i] > max_value) {
+                    max_value = token_logits[i];
+                    max_index = i;
+                }
+            }
+
+            // apply log softmax to token logit
+            float log_sum = std::log(std::accumulate(
+                token_logits, token_logits + vocab_size, 0.0f, [max_value](float accumulated, float to_add) {
+                    return accumulated + std::exp(to_add - max_value);
+            }));
+
+            sequence_group->append_prompt_log_prob(token_logit - max_value - log_sum);
+        }
+
+        currently_processed_tokens += prompt_len * num_running_sequences;
+        // For max_new_tokens == 0, we don't reach sampling so need to notify handle separately
+        if(sequence_group->get_max_new_tokens() == 0) {
+            sequence_group->notify_handle_echo_only();
+        }
+    }
+}
+
 enum class ModelType { Default, Whisper, TextEmbedding };
 
 Tensor init_attention_mask(const Tensor& input_ids) {
@@ -651,6 +736,11 @@ std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_impl(const std::sha
                                                                   const KVAxesPosition& kv_pos,
                                                                   ModelType model_type,
                                                                   const TextEmbeddingPipeline::Config& text_embed_config = {}) {
+    std::cout << "\n[NPU DEBUG] ===== compile_decoder_for_npu_impl() ENTRY =====" << std::endl;
+    std::cout << "[NPU DEBUG] Model name: " << model->get_friendly_name() << std::endl;
+    std::cout << "[NPU DEBUG] KV axes: batch=" << kv_pos.batch << ", seq_len=" << kv_pos.seq_len << std::endl;
+    std::cout << "[NPU DEBUG] Model type: " << static_cast<int>(model_type) << std::endl;
+    
     ov::CompiledModel compiled;
     ov::AnyMap properties = config;
     KVDesc kv_desc;
@@ -659,32 +749,126 @@ std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_impl(const std::sha
     const auto export_blob = pop_or_default(properties, "EXPORT_BLOB", false);
     const bool do_import = (!blob_path.empty() && !export_blob);
 
+    std::cout << "[NPU DEBUG] Blob handling:" << std::endl;
+    std::cout << "[NPU DEBUG]   - blob_path: '" << blob_path << "'" << std::endl;
+    std::cout << "[NPU DEBUG]   - export_blob: " << export_blob << std::endl;
+    std::cout << "[NPU DEBUG]   - do_import: " << do_import << std::endl;
+
     if (do_import) {
+        std::cout << "[NPU DEBUG] Importing pre-compiled blob from: " << blob_path << std::endl;
         import_npu_model(compiled, kv_desc, properties, blob_path);
+        std::cout << "[NPU DEBUG] Import completed successfully" << std::endl;
     } else {
+        std::cout << "[NPU DEBUG] Compiling model from scratch..." << std::endl;
+        
+        // Log KV cache parameters BEFORE compilation
+        std::cout << "[NPU DEBUG] ========== KV CACHE INSPECTION (BEFORE) ==========" << std::endl;
+        for (const auto& param : model->get_parameters()) {
+            const auto& name = param->get_friendly_name();
+            if (name.find("past_key_values") != std::string::npos) {
+                std::cout << "[NPU DEBUG] KV Parameter: " << name << std::endl;
+                std::cout << "[NPU DEBUG]   - shape: " << param->get_partial_shape() << std::endl;
+                std::cout << "[NPU DEBUG]   - element_type: " << param->get_element_type() << std::endl;
+            }
+        }
+        
+        for (const auto& op : model->get_ops()) {
+            if (op->get_type_name() == std::string("ReadValue")) {
+                std::cout << "[NPU DEBUG] ReadValue (KV cache state): " << op->get_friendly_name() << std::endl;
+                if (op->get_input_size() > 0) {
+                    std::cout << "[NPU DEBUG]   - input shape: " << op->get_input_partial_shape(0) << std::endl;
+                }
+                if (op->get_output_size() > 0) {
+                    std::cout << "[NPU DEBUG]   - output shape: " << op->get_output_partial_shape(0) << std::endl;
+                }
+            }
+        }
+        std::cout << "[NPU DEBUG] ===================================================" << std::endl;
+        
         switch (model_type) {
         case ModelType::TextEmbedding:
+            std::cout << "[NPU DEBUG] Configuring for TextEmbedding model" << std::endl;
             get_npu_text_embedding_config(properties, kv_pos, kv_desc, text_embed_config);
             break;
         case ModelType::Whisper:
+            std::cout << "[NPU DEBUG] Configuring for Whisper model" << std::endl;
             get_npu_model_config(properties, kv_pos, kv_desc, true);
             break;
         case ModelType::Default:
         default:
+            std::cout << "[NPU DEBUG] Configuring for Default (LLM) model" << std::endl;
             get_npu_model_config(properties, kv_pos, kv_desc, false);
             break;
         }
 
-        compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
+        std::cout << "[NPU DEBUG] KV cache configuration:" << std::endl;
+        std::cout << "[NPU DEBUG]   - max_prompt_len: " << kv_desc.max_prompt_len << std::endl;
+        std::cout << "[NPU DEBUG]   - min_response_len: " << kv_desc.min_response_len << std::endl;
+        
+        std::cout << "[NPU DEBUG] Final NPU properties:" << std::endl;
+        for (const auto& prop : properties) {
+            std::cout << "[NPU DEBUG]   - " << prop.first << " = ";
+            try {
+                std::cout << prop.second.as<std::string>();
+            } catch (...) {
+                std::cout << "<complex value>";
+            }
+            std::cout << std::endl;
+        }
+        
+        // Optional: Serialize model XML for debugging
+        if (const char* save_xml = std::getenv("NPU_DEBUG_SAVE_XML")) {
+            std::string xml_path = std::string(save_xml) + "_before_npu_compile.xml";
+            std::cout << "[NPU DEBUG] Saving model XML for debugging: " << xml_path << std::endl;
+            try {
+                ov::serialize(model, xml_path);
+                std::cout << "[NPU DEBUG] Model XML saved successfully" << std::endl;
+            } catch (const std::exception& e) {
+                std::cout << "[NPU DEBUG] WARNING: Failed to save XML: " << e.what() << std::endl;
+            }
+        }
+        
+        std::cout << "[NPU DEBUG] Calling Core::compile_model(model, 'NPU', properties)..." << std::endl;
+        std::cout << "[NPU DEBUG] **** THIS IS WHERE NPU COMPILATION HAPPENS ****" << std::endl;
+        
+        try {
+            compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
+            std::cout << "[NPU DEBUG] ✓ NPU compilation SUCCESSFUL!" << std::endl;
+            
+            // Log compiled model inputs/outputs to see what happened to KV cache
+            std::cout << "[NPU DEBUG] ========== COMPILED MODEL INSPECTION ==========" << std::endl;
+            std::cout << "[NPU DEBUG] Compiled model inputs:" << std::endl;
+            for (const auto& input : compiled.inputs()) {
+                const auto& name = input.get_any_name();
+                std::cout << "[NPU DEBUG]   - " << name << ": " << input.get_partial_shape() 
+                          << " (" << input.get_element_type() << ")" << std::endl;
+            }
+            
+            std::cout << "[NPU DEBUG] Compiled model outputs:" << std::endl;
+            for (const auto& output : compiled.outputs()) {
+                const auto& name = output.get_any_name();
+                std::cout << "[NPU DEBUG]   - " << name << ": " << output.get_partial_shape()
+                          << " (" << output.get_element_type() << ")" << std::endl;
+            }
+            std::cout << "[NPU DEBUG] ===================================================" << std::endl;
+            
+        } catch (const std::exception& e) {
+            std::cout << "[NPU DEBUG] ✗ NPU compilation FAILED!" << std::endl;
+            std::cout << "[NPU DEBUG] Exception: " << e.what() << std::endl;
+            throw;
+        }
+        
         // Also export compiled model if required
         if (export_blob) {
             if (blob_path.empty()) {
                 blob_path = "openvino_model.blob";
             }
+            std::cout << "[NPU DEBUG] Exporting compiled blob to: " << blob_path << std::endl;
             export_npu_model(compiled, blob_path);
         }
     }
 
+    std::cout << "[NPU DEBUG] ===== compile_decoder_for_npu_impl() EXIT =====" << std::endl;
     return {compiled, kv_desc};
 }
 
