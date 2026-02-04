@@ -60,8 +60,8 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         m_use_full_chat_history = true;
     }
 
-    // Slice optimization is always enabled (except on NPU where plugin handles it)
-    // Our optimized get_next_token_log_probs() works correctly with slice optimization
+    // FIXME: slicing produces incorrect results for some models on NPU.
+    // On NPU, applying slice the safe way is done by the underlying plugin
     if (!m_is_npu) {
         utils::apply_slice_before_matmul_transformation(model);
     }
@@ -80,8 +80,7 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     ov::CompiledModel compiled_model;
     if (m_is_npu) {
         utils::KVDesc kv_desc;
-        std::tie(compiled_model, kv_desc) = utils::compile_decoder_for_npu(model, *filtered_properties, kv_pos, false);
-        
+        std::tie(compiled_model, kv_desc) = utils::compile_decoder_for_npu(model, *filtered_properties, kv_pos);
         m_max_prompt_len = kv_desc.max_prompt_len;
         m_max_kv_cache_size = kv_desc.max_prompt_len + kv_desc.min_response_len;
     } else {
