@@ -253,7 +253,7 @@ public:
         perf_metrics.m_evaluated = false;
         perf_metrics.evaluate_statistics(start_time);
 
-        return {std::move(plain_tokens), std::move(plain_scores), std::move(perf_metrics), generated[0].extended_perf_metrics};
+        return {std::move(plain_tokens), std::move(plain_scores), {}, std::move(perf_metrics), generated[0].extended_perf_metrics};
     }
 
     void start_chat(const std::string& system_message) override {
@@ -262,6 +262,13 @@ public:
 
     void finish_chat() override {
         m_impl->finish_chat();
+    }
+
+    std::vector<float> get_next_token_log_probs(
+        const std::string& prompt,
+        const std::vector<int64_t>& token_ids
+    ) override {
+        OPENVINO_THROW("get_next_token_log_probs is not yet implemented for continuous batching pipeline");
     }
 };
 
