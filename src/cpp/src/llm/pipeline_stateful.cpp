@@ -351,9 +351,6 @@ EncodedResults StatefulLLMPipeline::generate(
             "Currently only \"num_return_sequences\" equal to 1 is supported for NPU device!");
     }
 
-    // echo could be supported if not enable SLICE_OUT
-    // OPENVINO_ASSERT(config.echo == false, "Echo is not supported in the stateful pipeline");
-
     std::shared_ptr<StreamerBase> streamer_ptr = ov::genai::utils::create_streamer(streamer, m_tokenizer);
 
     OPENVINO_ASSERT(streamer_ptr == nullptr || batch_size == 1 && config.num_return_sequences == 1 &&
