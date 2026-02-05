@@ -6,12 +6,9 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
-#include <iostream>
 
 #include "lora/helper.hpp"
 #include "lm_encoding.hpp"
-#include "openvino/genai/llm_pipeline.hpp"
 #include "openvino/genai/text_streamer.hpp"
 
 #include "utils.hpp"

@@ -319,6 +319,7 @@ class SequenceGroup  : public std::enable_shared_from_this<SequenceGroup> {
     TokenIds m_prompt_ids;
     std::vector<std::vector<float>> m_input_embeds;
     std::optional<std::vector<int64_t>> m_token_type_ids;
+    std::vector<float> m_prompt_log_probs;
     GenerationStream::Ptr m_generation_stream;
     size_t m_num_evicted_tokens = 0;
     bool m_has_echoed = false;
@@ -411,6 +412,7 @@ public:
         else {
             OPENVINO_THROW("Unknown tensor format.");
         }
+        m_prompt_log_probs.reserve(prompt_len);
 
         auto sequence = Sequence::create(m_next_sequence_id++, m_sequence_group_type, hidden_size);
 
@@ -711,6 +713,10 @@ public:
         return m_input_embeds[0].size();
     }
 
+    void append_prompt_log_prob(float log_prob) {
+        m_prompt_log_probs.push_back(log_prob);
+    }
+
     SequenceGroupType get_sequence_group_type() const {
         return m_sequence_group_type;
     }
@@ -802,6 +808,7 @@ public:
             output.generated_log_probs = sequence->get_generated_log_probs();
             if (m_sampling_params.echo) {
                 output.generated_ids.insert(output.generated_ids.begin(), m_prompt_ids.begin(), m_prompt_ids.end());
+                output.generated_log_probs.insert(output.generated_log_probs.begin(), m_prompt_log_probs.begin(), m_prompt_log_probs.end());
             }
             output.score = m_sampling_params.is_beam_search() ? sequence->get_beam_search_score(m_sampling_params) : sequence->get_cumulative_log_prob();
             output.finish_reason = sequence->get_finish_reason();
@@ -818,6 +825,7 @@ public:
             auto output = sequence->get_last_generation_output(token_cnt, m_stream_window_size);
             if (m_sampling_params.echo && !m_has_echoed) {
                 output.generated_ids.insert(output.generated_ids.begin(), m_prompt_ids.begin(), m_prompt_ids.end());
+                output.generated_log_probs.insert(output.generated_log_probs.begin(), m_prompt_log_probs.begin(), m_prompt_log_probs.end());
             }
             outputs.emplace(sequence->get_grouped_id(), output);
         }
@@ -876,6 +884,7 @@ public:
 
         GenerationOutput output;
         output.generated_ids = std::vector<int64_t>(m_prompt_ids.begin() + first_token_position, m_prompt_ids.begin() + last_token_position);
+        output.generated_log_probs = std::vector<float>(m_prompt_log_probs.begin() + first_token_position, m_prompt_log_probs.begin() + last_token_position);
         output.score = 0.0; // Should we accumulate prompt log probs here?
         output.finish_reason = GenerationFinishReason::NONE;
 
