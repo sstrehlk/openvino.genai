@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2026 Intel Corporation
+// Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -18,7 +18,6 @@
 #include "visual_language/processor_config.hpp"
 
 #include "openvino/genai/streamer_base.hpp"
-#include "sequence_group.hpp"
 
 namespace ov {
 namespace genai {

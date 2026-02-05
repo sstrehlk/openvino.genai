@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2026 Intel Corporation
+// Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
 #include "utils.hpp"
@@ -674,22 +674,8 @@ std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_impl(const std::sha
             get_npu_model_config(properties, kv_pos, kv_desc, false);
             break;
         }
-        
-        // Optional: Serialize model XML for debugging
-        if (const char* save_xml = std::getenv("NPU_DEBUG_SAVE_XML")) {
-            std::string xml_path = std::string(save_xml) + "_before_npu_compile.xml";
-            try {
-                ov::serialize(model, xml_path);
-            } catch (const std::exception& e) {
-            }
-        }
-        
-        try {
-            compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
-        } catch (const std::exception& e) {
-            throw;
-        }
-        
+
+        compiled = ov::genai::utils::singleton_core().compile_model(model, "NPU", properties);
         // Also export compiled model if required
         if (export_blob) {
             if (blob_path.empty()) {
